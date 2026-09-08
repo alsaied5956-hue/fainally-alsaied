@@ -1,0 +1,89 @@
+{
+  "entities": {
+    "SystemState": {
+      "title": "SystemState",
+      "description": "The complete synced center management state including students, attendance records, payments, and configs.",
+      "type": "object",
+      "properties": {
+        "students": {
+          "type": "array",
+          "description": "List of registered students in the system."
+        },
+        "attendanceHistory": {
+          "type": "object",
+          "description": "Daily attendance history indexed by date string."
+        },
+        "attendanceToday": {
+          "type": "object",
+          "description": "Today's scanned attendance indexed by student barcode."
+        },
+        "scanLogTimes": {
+          "type": "object",
+          "description": "Scanned attendance timestamps."
+        },
+        "payments": {
+          "type": "object",
+          "description": "Monthly payment records for students."
+        },
+        "scanLogOrder": {
+          "type": "array",
+          "description": "Sequential order of scanned barcodes for today."
+        },
+        "usersList": {
+          "type": "array",
+          "description": "System accounts and permissions."
+        },
+        "groupPrices": {
+          "type": "object",
+          "description": "Monthly pricing configured per academic grade."
+        },
+        "activeSessionSlotId": {
+          "type": "string",
+          "description": "Active session time slot configuration."
+        },
+        "pendingWhatsAppMessages": {
+          "type": "array",
+          "description": "Offline WhatsApp outbox queue messages."
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp of last cloud synchronization."
+        }
+      }
+    },
+    "LiveEvent": {
+      "title": "LiveEvent",
+      "description": "Real-time lightweight attendance and scan event for the secondary notification system.",
+      "type": "object",
+      "properties": {
+        "studentId": {
+          "type": "string",
+          "description": "Barcode or ID of the student."
+        },
+        "status": {
+          "type": "string",
+          "description": "Attendance status (حضور, غياب, تأخير)."
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "Epoch timestamp in milliseconds."
+        }
+      },
+      "required": ["studentId", "status", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/system_state/{stateId}": {
+      "schema": {
+        "$ref": "SystemState"
+      },
+      "description": "Stores system state and records for the educational center."
+    },
+    "/live_events/{docId}": {
+      "schema": {
+        "$ref": "LiveEvent"
+      },
+      "description": "Stores ultra-fast live scan events for the secondary parent notification system."
+    }
+  }
+}

@@ -1,0 +1,40 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. High-scalability partitioned system state chunks and main registry
+    match /system_state/{docId} {
+      allow read, write: if true;
+    }
+
+    // 2. Partitioned collections for high-volume batch writes, inserts, and bulk deletes
+    match /students/{studentId} {
+      allow read, write, delete: if true;
+    }
+
+    match /payment_records/{recordId} {
+      allow read, write, delete: if true;
+    }
+
+    match /platform_messages/{messageId} {
+      allow read, write, delete: if true;
+    }
+
+    match /attendance_records/{recordId} {
+      allow read, write, delete: if true;
+    }
+
+    match /batch_operations/{batchId} {
+      allow read, write, delete: if true;
+    }
+
+    // 3. Ultra-fast realtime live events stream for secondary system notification
+    match /live_events/{docId} {
+      allow read, write, delete: if true;
+    }
+
+    // General fallback rule for high-concurrency app operations
+    match /{document=**} {
+      allow read, write: if true;
+    }
+  }
+}
