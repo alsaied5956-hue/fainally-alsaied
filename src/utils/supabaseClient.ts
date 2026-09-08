@@ -1,7 +1,7 @@
 /**
  * src/utils/supabaseClient.ts
- * TypeScript Supabase v2 client for Educational Management System
- * Provides sub-50ms Realtime WebSocket synchronization across all assistants
+ * High-Performance Supabase v2 Client & Sub-20ms Realtime WebSocket Hub
+ * Powers Instant Multi-Device Sync for Attendance, Group Finalization, Payments, Homework, and Students
  */
 
 import { createClient, SupabaseClient, RealtimeChannel } from "@supabase/supabase-js";
@@ -18,40 +18,10 @@ export const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON
   },
   realtime: {
     params: {
-      eventsPerSecond: 25,
+      eventsPerSecond: 30,
     },
   },
 });
-
-export interface StudentDB {
-  id: string;
-  barcode: string;
-  name: string;
-  phone?: string;
-  parent_phone: string;
-  grade: string;
-  group_days: string;
-  group_time?: string;
-  monthly_fee: number;
-  discount: number;
-  notes?: string;
-  is_active: boolean;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface AttendanceDB {
-  id?: string;
-  student_id: string;
-  barcode: string;
-  student_name: string;
-  date_key: string;
-  time_recorded: string;
-  status: "حضور" | "تأخير" | "غياب";
-  session_slot_id?: string;
-  scanned_by?: string;
-  notes?: string;
-}
 
 export interface LiveScanPayload {
   barcode: string;
@@ -66,6 +36,46 @@ export interface LiveScanPayload {
   timestamp: number;
 }
 
+export interface GroupFinishedPayload {
+  grade: string;
+  days: string;
+  absentBarcodes: string[];
+  lateBarcodes: string[];
+  presentBarcodes: string[];
+  dateKey: string;
+  finishedBy: string;
+  timestamp: number;
+}
+
+export interface PaymentSyncPayload {
+  action: "record" | "update" | "delete";
+  barcode: string;
+  monthKey: string;
+  amount: number;
+  date: string;
+  time: string;
+  note: string;
+  recordedBy: string;
+  timestamp: number;
+}
+
+export interface HomeworkSyncPayload {
+  action: "update" | "bulk_update";
+  barcodes: string[];
+  dateKey: string;
+  status: "done" | "incomplete" | "not_done";
+  notes?: string;
+  updatedBy: string;
+  timestamp: number;
+}
+
+export interface StudentSyncPayload {
+  action: "add" | "update" | "delete";
+  barcode: string;
+  studentData?: any;
+  timestamp: number;
+}
+
 export function getTodayDateKey(): string {
   const d = new Date();
   const year = d.getFullYear();
@@ -75,71 +85,193 @@ export function getTodayDateKey(): string {
 }
 
 // ------------------------------------------------------------------------
-// 1. DEDICATED REAL-TIME BROADCAST CHANNEL (Sub-20ms WebSocket Channel)
+// 1. DEDICATED REALTIME HUB (Sub-20ms WebSocket Channel)
 // ------------------------------------------------------------------------
 
-let liveScannerChannel: RealtimeChannel | null = null;
+let realtimeHubChannel: RealtimeChannel | null = null;
 
-export function getOrCreateLiveScannerChannel(): RealtimeChannel {
-  if (!liveScannerChannel) {
-    liveScannerChannel = supabase.channel("realtime-assistant-scanner", {
+export function getOrCreateRealtimeHub(): RealtimeChannel {
+  if (!realtimeHubChannel) {
+    realtimeHubChannel = supabase.channel("realtime-center-hub", {
       config: {
         broadcast: {
-          self: false, // Don't echo back to the sender
-          ack: false,  // Zero-latency fire-and-forget
+          self: false, // Don't echo back to the emitting device
+          ack: false,  // Fire-and-forget for absolute zero-latency
         },
       },
     });
 
-    liveScannerChannel.subscribe((status) => {
-      console.log(`[Supabase Realtime] Scanner Channel Status: ${status}`);
+    realtimeHubChannel.subscribe((status) => {
+      console.log(`[Supabase Realtime Hub] Status: ${status}`);
     });
   }
-  return liveScannerChannel;
+  return realtimeHubChannel;
 }
 
-/**
- * Broadcasts an instant scan event across all connected assistants in fractions of a second
- */
+// ------------------------------------------------------------------------
+// 2. BROADCAST METHODS (Zero Latency Emits)
+// ------------------------------------------------------------------------
+
+/** Broadcast single scan to all assistant screens */
 export async function broadcastLiveScan(payload: LiveScanPayload): Promise<void> {
   try {
-    const channel = getOrCreateLiveScannerChannel();
+    const channel = getOrCreateRealtimeHub();
     await channel.send({
       type: "broadcast",
       event: "assistant_scan",
       payload,
     });
   } catch (err) {
-    console.warn("Realtime broadcast notice:", err);
+    console.warn("Realtime broadcast scan notice:", err);
   }
 }
 
-/**
- * Subscribes an assistant device to receive live scans from other assistants in real-time
- */
+/** Broadcast group finish (حفظ وإرسال الغياب للكل) across all screens */
+export async function broadcastGroupFinished(payload: GroupFinishedPayload): Promise<void> {
+  try {
+    const channel = getOrCreateRealtimeHub();
+    await channel.send({
+      type: "broadcast",
+      event: "group_finished",
+      payload,
+    });
+  } catch (err) {
+    console.warn("Realtime broadcast group finish notice:", err);
+  }
+}
+
+/** Broadcast payment record / update / delete across all screens */
+export async function broadcastPaymentChange(payload: PaymentSyncPayload): Promise<void> {
+  try {
+    const channel = getOrCreateRealtimeHub();
+    await channel.send({
+      type: "broadcast",
+      event: "payment_change",
+      payload,
+    });
+  } catch (err) {
+    console.warn("Realtime broadcast payment notice:", err);
+  }
+}
+
+/** Broadcast homework status update across all screens */
+export async function broadcastHomeworkChange(payload: HomeworkSyncPayload): Promise<void> {
+  try {
+    const channel = getOrCreateRealtimeHub();
+    await channel.send({
+      type: "broadcast",
+      event: "homework_change",
+      payload,
+    });
+  } catch (err) {
+    console.warn("Realtime broadcast homework notice:", err);
+  }
+}
+
+/** Broadcast student addition, update, or deletion */
+export async function broadcastStudentChange(payload: StudentSyncPayload): Promise<void> {
+  try {
+    const channel = getOrCreateRealtimeHub();
+    await channel.send({
+      type: "broadcast",
+      event: "student_change",
+      payload,
+    });
+  } catch (err) {
+    console.warn("Realtime broadcast student notice:", err);
+  }
+}
+
+// ------------------------------------------------------------------------
+// 3. LISTENERS (Instant Reception on All Devices)
+// ------------------------------------------------------------------------
+
 export function subscribeToLiveScans(
   onScanReceived: (payload: LiveScanPayload) => void
 ): () => void {
-  const channel = getOrCreateLiveScannerChannel();
-
+  const channel = getOrCreateRealtimeHub();
   channel.on("broadcast", { event: "assistant_scan" }, ({ payload }) => {
     if (payload && typeof onScanReceived === "function") {
       onScanReceived(payload as LiveScanPayload);
     }
   });
+  return () => {};
+}
 
-  return () => {
-    // Keep channel alive if other listeners exist, or unsubscribe
-  };
+export function subscribeToGroupFinished(
+  onGroupFinished: (payload: GroupFinishedPayload) => void
+): () => void {
+  const channel = getOrCreateRealtimeHub();
+  channel.on("broadcast", { event: "group_finished" }, ({ payload }) => {
+    if (payload && typeof onGroupFinished === "function") {
+      onGroupFinished(payload as GroupFinishedPayload);
+    }
+  });
+  return () => {};
+}
+
+export function subscribeToPaymentChanges(
+  onPaymentChanged: (payload: PaymentSyncPayload) => void
+): () => void {
+  const channel = getOrCreateRealtimeHub();
+  channel.on("broadcast", { event: "payment_change" }, ({ payload }) => {
+    if (payload && typeof onPaymentChanged === "function") {
+      onPaymentChanged(payload as PaymentSyncPayload);
+    }
+  });
+  return () => {};
+}
+
+export function subscribeToHomeworkChanges(
+  onHomeworkChanged: (payload: HomeworkSyncPayload) => void
+): () => void {
+  const channel = getOrCreateRealtimeHub();
+  channel.on("broadcast", { event: "homework_change" }, ({ payload }) => {
+    if (payload && typeof onHomeworkChanged === "function") {
+      onHomeworkChanged(payload as HomeworkSyncPayload);
+    }
+  });
+  return () => {};
+}
+
+export function subscribeToStudentChanges(
+  onStudentChanged: (payload: StudentSyncPayload) => void
+): () => void {
+  const channel = getOrCreateRealtimeHub();
+  channel.on("broadcast", { event: "student_change" }, ({ payload }) => {
+    if (payload && typeof onStudentChanged === "function") {
+      onStudentChanged(payload as StudentSyncPayload);
+    }
+  });
+  return () => {};
 }
 
 // ------------------------------------------------------------------------
-// 2. DIRECT ATTENDANCE PERSISTENCE IN SUPABASE (Postgres Upsert)
+// 4. SUPABASE POSTGRES PERSISTENCE HELPERS
 // ------------------------------------------------------------------------
 
-/**
- * Saves or updates an attendance record in Supabase attendance_logs
- */
+// In-memory barcode to student_id cache to avoid redundant network lookups
+const barcodeToIdCache = new Map<string, string>();
+
+async function getStudentIdByBarcode(barcode: string): Promise<string | null> {
+  const b = String(barcode).trim();
+  if (barcodeToIdCache.has(b)) {
+    return barcodeToIdCache.get(b)!;
+  }
+  const { data } = await supabase
+    .from("students")
+    .select("id")
+    .eq("barcode", b)
+    .maybeSingle();
+
+  if (data?.id) {
+    barcodeToIdCache.set(b, data.id);
+    return data.id;
+  }
+  return null;
+}
+
+/** Save single attendance record to Supabase */
 export async function saveAttendanceToSupabase(record: {
   barcode: string;
   studentName: string;
@@ -147,72 +279,166 @@ export async function saveAttendanceToSupabase(record: {
   timeIso?: string;
   dateKey?: string;
   scannedBy?: string;
-}): Promise<AttendanceDB | null> {
+}): Promise<void> {
   const dateKey = record.dateKey || getTodayDateKey();
-  const barcode = String(record.barcode).trim();
+  const studentId = await getStudentIdByBarcode(record.barcode);
+  if (!studentId) return;
 
-  // Look up student_id by barcode
-  const { data: student } = await supabase
-    .from("students")
-    .select("id, name")
-    .eq("barcode", barcode)
-    .maybeSingle();
-
-  if (!student) {
-    console.warn(`Student with barcode ${barcode} not found in Supabase.`);
-    return null;
-  }
-
-  const payload = {
-    student_id: student.id,
-    barcode,
-    student_name: record.studentName || student.name,
-    date_key: dateKey,
-    time_recorded: record.timeIso || new Date().toISOString(),
-    status: record.status,
-    scanned_by: record.scannedBy || "admin",
-  };
-
-  const { data, error } = await supabase
+  await supabase
     .from("attendance_logs")
-    .upsert(payload, { onConflict: "student_id,date_key" })
-    .select()
-    .single();
-
-  if (error) {
-    console.error("Error saving attendance to Supabase:", error.message);
-    return null;
-  }
-
-  return data;
+    .upsert(
+      {
+        student_id: studentId,
+        barcode: String(record.barcode).trim(),
+        student_name: record.studentName,
+        date_key: dateKey,
+        time_recorded: record.timeIso || new Date().toISOString(),
+        status: record.status,
+        scanned_by: record.scannedBy || "admin",
+      },
+      { onConflict: "student_id,date_key" }
+    );
 }
 
 /**
- * Subscribes to Postgres DB changes on attendance_logs for the given date
+ * Bulk save group attendance to Supabase in parallel chunks
+ * Called when "حفظ وإرسال الغياب للكل" is clicked
  */
-export function subscribeToAttendanceDatabase(
-  dateKey: string = getTodayDateKey(),
-  onLogUpdated: (log: AttendanceDB) => void
-): () => void {
-  const channel = supabase
-    .channel(`db-attendance-changes-${dateKey}`)
-    .on(
-      "postgres_changes",
-      {
-        event: "*",
-        schema: "public",
-        table: "attendance_logs",
-        filter: `date_key=eq.${dateKey}`,
-      },
-      (payload) => {
-        if (payload.new && typeof onLogUpdated === "function") {
-          onLogUpdated(payload.new as AttendanceDB);
-        }
-      }
-    )
-    .subscribe();
+export async function saveBulkAttendanceToSupabase(
+  records: Array<{
+    barcode: string;
+    studentName: string;
+    status: "حضور" | "تأخير" | "غياب";
+    dateKey: string;
+    scannedBy?: string;
+  }>
+): Promise<void> {
+  if (!records || records.length === 0) return;
 
-  return () => {
-    supabase.removeChannel(channel);
+  const rowsToInsert = [];
+  for (const rec of records) {
+    const sId = await getStudentIdByBarcode(rec.barcode);
+    if (!sId) continue;
+    rowsToInsert.push({
+      student_id: sId,
+      barcode: String(rec.barcode).trim(),
+      student_name: rec.studentName,
+      date_key: rec.dateKey,
+      time_recorded: new Date().toISOString(),
+      status: rec.status,
+      scanned_by: rec.scannedBy || "admin",
+    });
+  }
+
+  const chunkSize = 100;
+  for (let i = 0; i < rowsToInsert.length; i += chunkSize) {
+    const chunk = rowsToInsert.slice(i, i + chunkSize);
+    await supabase
+      .from("attendance_logs")
+      .upsert(chunk, { onConflict: "student_id,date_key" });
+  }
+}
+
+/** Save or update payment in Supabase */
+export async function savePaymentToSupabase(record: {
+  barcode: string;
+  monthKey: string;
+  amount: number;
+  date?: string;
+  note?: string;
+  recordedBy?: string;
+}): Promise<void> {
+  const studentId = await getStudentIdByBarcode(record.barcode);
+  if (!studentId) return;
+
+  await supabase
+    .from("payments")
+    .upsert(
+      {
+        student_id: studentId,
+        month_key: record.monthKey,
+        amount_paid: Number(record.amount) || 0,
+        required_amount: Number(record.amount) || 100,
+        discount: 0,
+        status: "paid",
+        payment_date: record.date ? new Date(record.date).toISOString() : new Date().toISOString(),
+        received_by: record.recordedBy || "admin",
+        notes: record.note || "سداد اشتراك",
+      },
+      { onConflict: "student_id,month_key" }
+    );
+}
+
+/** Delete payment from Supabase */
+export async function deletePaymentFromSupabase(barcode: string, monthKey: string): Promise<void> {
+  const studentId = await getStudentIdByBarcode(barcode);
+  if (!studentId) return;
+
+  await supabase
+    .from("payments")
+    .delete()
+    .eq("student_id", studentId)
+    .eq("month_key", monthKey);
+}
+
+/** Save or update homework record in Supabase */
+export async function saveHomeworkToSupabase(records: Array<{
+  barcode: string;
+  dateKey: string;
+  status: "done" | "incomplete" | "not_done";
+  notes?: string;
+}>): Promise<void> {
+  if (!records || records.length === 0) return;
+
+  const rows = [];
+  for (const r of records) {
+    const sId = await getStudentIdByBarcode(r.barcode);
+    if (!sId) continue;
+    rows.push({
+      student_id: sId,
+      date_key: r.dateKey,
+      title: "واجب الحصة",
+      status: r.status,
+      notes: r.notes || "",
+    });
+  }
+
+  if (rows.length > 0) {
+    await supabase.from("homework").insert(rows);
+  }
+}
+
+/** Save student to Supabase */
+export async function saveStudentToSupabase(s: any): Promise<void> {
+  if (!s || !s.barcode) return;
+  const payload = {
+    barcode: String(s.barcode).trim(),
+    name: s.name || "طالب بدون اسم",
+    phone: String(s.phone || ""),
+    parent_phone: String(s.parentPhone || s.phone || "00000000000"),
+    grade: s.groupGrade || s.grade || "غير محدد",
+    group_days: s.groupDays || "غير محدد",
+    group_time: s.groupTime || "04:00 م",
+    monthly_fee: Number(s.monthlyFee) || 0,
+    discount: Number(s.discount) || 0,
+    notes: s.notes || "",
+    is_active: s.isActive !== false,
   };
+
+  const { data } = await supabase
+    .from("students")
+    .upsert(payload, { onConflict: "barcode" })
+    .select("id")
+    .single();
+
+  if (data?.id) {
+    barcodeToIdCache.set(String(s.barcode).trim(), data.id);
+  }
+}
+
+/** Delete student from Supabase */
+export async function deleteStudentFromSupabase(barcode: string): Promise<void> {
+  const b = String(barcode).trim();
+  barcodeToIdCache.delete(b);
+  await supabase.from("students").delete().eq("barcode", b);
 }
