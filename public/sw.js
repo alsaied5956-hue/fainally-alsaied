@@ -35,11 +35,13 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const request = event.request;
 
-  // Don't intercept non-GET requests or Firebase/Google API cloud calls
+  // Don't intercept non-GET requests, API routes, or Firebase/Google API cloud calls
   if (
     request.method !== "GET" ||
+    request.url.includes("/api/") ||
     request.url.includes("firestore.googleapis.com") ||
     request.url.includes("firebaseapp.com") ||
+    request.url.includes("supabase.co") ||
     request.url.includes("identitytoolkit.googleapis.com") ||
     request.url.includes("chrome-extension")
   ) {

@@ -174,3 +174,41 @@ export type TabType =
   | "manage-students"
   | "users"
   | "settings";
+
+// ------------------------------------------------------------------------
+// Types for Isolated Device Entry/Exit & Unified Integration Hub
+// ------------------------------------------------------------------------
+export type EntryExitType = "دخول" | "خروج";
+
+export interface DeviceEntryExitEvent {
+  id: string;
+  deviceId: string;
+  deviceName?: string;
+  deviceLocation?: string;
+  barcode: string;
+  studentName: string;
+  grade?: string;
+  days?: string;
+  type: EntryExitType; // "دخول" أو "خروج"
+  timestamp: number;
+  timeIso: string;
+  timeDisplay: string;
+  dateKey: string;
+  notes?: string;
+  syncedToUnified?: boolean;
+}
+
+export interface DeviceInfo {
+  deviceId: string;
+  deviceName: string;
+  deviceLocation?: string;
+  lastActive: number;
+  ip?: string;
+  status: "online" | "offline";
+  totalScansCount: number;
+  lastScanType?: EntryExitType;
+  lastScanStudentName?: string;
+  lastScanTime?: string;
+}
+
+export type DeviceOperatingMode = "unified" | "device_specific";

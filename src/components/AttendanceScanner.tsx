@@ -17,6 +17,7 @@ import { StudentSearchBox } from "./StudentSearchBox";
 import { enqueuePlatformMessagesBatch, flushPendingSyncToCloud } from "../utils/storage";
 import { pushLiveAttendanceEvent } from "../utils/liveEventStream";
 import { dualSyncLiveScan } from "../utils/dualSync";
+import { recordDeviceEntryExitScan } from "../utils/deviceClient";
 import {
   subscribeToLiveScans,
   LiveScanPayload,
@@ -36,6 +37,8 @@ import {
   Bell,
   ArrowLeft,
   ArrowRight,
+  ArrowDownRight,
+  ArrowUpRight,
   Users,
   AlertTriangle,
   UserX,
@@ -158,6 +161,7 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     queueItems?: { student: Student; message: string; type: "غائب" | "تأخير" | "عكس_أيام" }[];
   } | null>(null);
 
+  const [scanDirectionMode, setScanDirectionMode] = useState<"entry" | "exit">("entry");
   const [scanAlert, setScanAlert] = useState<{
     type: "success" | "warning" | "error";
     title: string;
@@ -377,6 +381,30 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
         type: "error",
         title: "❌ باركود غير مسجل",
         message: `الباركود (${barcode}) غير مسجل في منظومة الطلاب! يرجى إضافة الطالب أولاً.`,
+      });
+      return;
+    }
+
+    // If in Exit scanning mode (بوابة الخروج)
+    if (scanDirectionMode === "exit") {
+      const now = new Date();
+      const nowTimeStr = now.toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" });
+      recordDeviceEntryExitScan({
+        barcode: student.barcode,
+        type: "خروج",
+        studentName: student.name,
+        grade: student.groupGrade,
+        days: student.groupDays,
+        syncToUnifiedAttendance: false,
+      });
+      playBeep("success");
+      setScanAlert({
+        type: "success",
+        title: `🔴 تسجيل خروج الطالب: ${student.name}`,
+        message: `تم تسجيل مغادرة الطالب بنجاح عبر بوابة الخروج [${student.groupGrade} - ${student.groupDays}] في تمام (${nowTimeStr})`,
+        student,
+        time: nowTimeStr,
+        status: "خروج",
       });
       return;
     }
@@ -949,9 +977,43 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
 
       {/* Barcode Scanner Input Spotlight & Manual Actions */}
       <div className="max-w-3xl mx-auto text-center space-y-3.5">
+        {/* Entry / Exit Mode Selector */}
+        <div className="flex items-center justify-center gap-2">
+          <div className="inline-flex p-1 rounded-2xl bg-slate-900/90 border border-slate-700/80 shadow-md">
+            <button
+              type="button"
+              onClick={() => setScanDirectionMode("entry")}
+              className={`px-4 py-2 rounded-xl text-xs font-black transition-all flex items-center gap-1.5 cursor-pointer ${
+                scanDirectionMode === "entry"
+                  ? "bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-lg shadow-emerald-500/20"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              <ArrowDownRight className="w-4 h-4" />
+              <span>تسجيل حضور ودخول الحصة 🟢</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setScanDirectionMode("exit")}
+              className={`px-4 py-2 rounded-xl text-xs font-black transition-all flex items-center gap-1.5 cursor-pointer ${
+                scanDirectionMode === "exit"
+                  ? "bg-gradient-to-r from-rose-600 to-amber-600 text-white shadow-lg shadow-rose-500/20"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              <ArrowUpRight className="w-4 h-4" />
+              <span>تسجيل خروج ومغادرة الطالب 🔴</span>
+            </button>
+          </div>
+        </div>
+
         <label className="text-base md:text-lg font-bold text-amber-300 flex items-center justify-center gap-2 font-fancy">
           <Sparkles className="w-5 h-5 text-amber-400" />
-          <span>مرر كارت الطالب أمام الإسكانر لتسجيل الحضور الفوري</span>
+          <span>
+            {scanDirectionMode === "entry"
+              ? "مرر كارت الطالب أمام الإسكانر لتسجيل الحضور الفوري"
+              : "مرر كارت الطالب لتسجيل الخروج والمغادرة من المركز"}
+          </span>
         </label>
 
         <form onSubmit={handleScanSubmit} className="flex flex-wrap sm:flex-nowrap gap-2.5">

@@ -46,7 +46,14 @@ export const CLIENT_ID =
   typeof window !== "undefined"
     ? ((window as any).__AIMAN_CLIENT_ID ||
       ((window as any).__AIMAN_CLIENT_ID =
-        Math.random().toString(36).substring(2, 11) + "_" + Date.now()))
+        localStorage.getItem("app_persistent_device_id") ||
+        (() => {
+          const newId = "dev_" + Math.random().toString(36).substring(2, 9) + "_" + Date.now().toString(36);
+          try {
+            localStorage.setItem("app_persistent_device_id", newId);
+          } catch {}
+          return newId;
+        })()))
     : "server_instance";
 
 export interface SystemData {
@@ -2282,6 +2289,30 @@ if (typeof window !== "undefined") {
         const payload = JSON.parse(event.data);
         if (payload?.type === "state_update" && payload?.sourceDeviceId !== CLIENT_ID && payload?.data) {
           applyIncomingRemoteState(payload.data);
+        } else if (payload?.type === "device_entry_notification" && payload?.barcode) {
+          // Device recorded entry at gate - instant lightweight update without downloading entire payload
+          const current = loadLocalData();
+          const bc = String(payload.barcode).trim();
+          if (bc && current.attendanceToday?.[bc] !== "حضور") {
+            const updatedAtt = { ...(current.attendanceToday || {}), [bc]: "حضور" };
+            const updatedTimes = { ...(current.scanLogTimes || {}), [bc]: payload.timeIso || new Date().toISOString() };
+            const updatedOrder = Array.isArray(current.scanLogOrder)
+              ? [bc, ...current.scanLogOrder.filter((b) => b !== bc)]
+              : [bc];
+            const updated: SystemData = {
+              ...current,
+              attendanceToday: updatedAtt,
+              scanLogTimes: updatedTimes,
+              scanLogOrder: updatedOrder,
+              scanLogUpdatedAt: Date.now(),
+            };
+            saveToLocalStorage(updated, false);
+            notifySyncStatusChange();
+            notifyCloudDataListeners(updated);
+            if (typeof window !== "undefined") {
+              window.dispatchEvent(new CustomEvent("center-data-updated", { detail: updated }));
+            }
+          }
         }
       } catch {}
     };

@@ -29,7 +29,9 @@ import {
   Database,
   Server,
   Zap,
+  Cpu,
 } from "lucide-react";
+import { DeviceApiIntegrationView } from "./DeviceApiIntegrationView";
 import {
   syncAndMergeAllDevicesData,
   exportCompleteBackupJSON,
@@ -90,7 +92,7 @@ export const MultiDeviceSyncModal: React.FC<MultiDeviceSyncModalProps> = ({
   const [selectedGrade, setSelectedGrade] = useState<string>("ALL");
   const [statusFilter, setStatusFilter] = useState<"ALL" | "PAID" | "UNPAID">("ALL");
   const [searchQuery, setSearchQuery] = useState("");
-  const [activeViewTab, setActiveViewTab] = useState<"financials" | "sync_actions" | "cloud_diagnostics">("financials");
+  const [activeViewTab, setActiveViewTab] = useState<"financials" | "sync_actions" | "device_apis" | "cloud_diagnostics">("financials");
   const [pingResult, setPingResult] = useState<{ ok: boolean; latencyMs: number; error?: string } | null>(null);
   const [isPinging, setIsPinging] = useState(false);
   const [diagnosticsData, setDiagnosticsData] = useState<CloudDiagnosticsInfo>(() => getCloudDiagnostics());
@@ -440,6 +442,18 @@ export const MultiDeviceSyncModal: React.FC<MultiDeviceSyncModalProps> = ({
             >
               <CloudUpload className="w-4 h-4" />
               <span>🔄 إجراءات المزامنة والدمج السحابي</span>
+            </button>
+
+            <button
+              onClick={() => setActiveViewTab("device_apis")}
+              className={`px-4 py-2 rounded-xl text-xs font-black transition-all flex items-center gap-2 cursor-pointer ${
+                activeViewTab === "device_apis"
+                  ? "bg-gradient-to-r from-amber-600 to-orange-600 text-white shadow-md"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              <Cpu className="w-4 h-4" />
+              <span>📱 ربط الأجهزة والدخول والخروج (APIs)</span>
             </button>
 
             <button
@@ -1255,6 +1269,11 @@ export const MultiDeviceSyncModal: React.FC<MultiDeviceSyncModalProps> = ({
               </div>
 
             </div>
+          )}
+
+          {/* View Tab 4: Isolated Device APIs & Entry/Exit Hub */}
+          {activeViewTab === "device_apis" && (
+            <DeviceApiIntegrationView students={students} />
           )}
 
         </div>

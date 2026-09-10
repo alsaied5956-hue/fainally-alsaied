@@ -37,6 +37,7 @@ import {
   getTodayDateKey,
 } from "./supabaseClient";
 import { pushLiveAttendanceEvent, pushLiveAttendanceBatch } from "./liveEventStream";
+import { recordDeviceEntryExitScan } from "./deviceClient";
 import { Student } from "../types";
 
 // Safe non-blocking execution wrapper
@@ -141,6 +142,19 @@ export function dualSyncLiveScan(params: ScanSyncParams) {
       );
     })(),
     "Firebase attendance_records individual doc"
+  );
+
+  // 5️⃣ Isolated Device API scan logging (Zero-cache, device-specific ledger)
+  runInBackground(
+    recordDeviceEntryExitScan({
+      barcode: b,
+      type: "دخول",
+      studentName: params.name,
+      grade: params.grade,
+      days: params.days,
+      syncToUnifiedAttendance: true,
+    }),
+    "Device Hub recordDeviceEntryExitScan"
   );
 }
 
