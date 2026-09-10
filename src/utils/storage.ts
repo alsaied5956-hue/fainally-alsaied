@@ -104,11 +104,37 @@ export const ALL_PERMISSIONS: PermissionKey[] = [
 export const DEFAULT_USERS: UserAccount[] = [
   {
     username: "admin",
-    pass: "admin123",
+    pass: "2468",
     role: "admin",
     permissions: [...ALL_PERMISSIONS],
   },
 ];
+
+/**
+ * Normalizes user accounts ensuring supervisor account (admin) ALWAYS exists with password 2468
+ * and full administrative permissions across all devices.
+ */
+export function normalizeUsersList(rawUsers?: UserAccount[]): UserAccount[] {
+  let list: UserAccount[] = Array.isArray(rawUsers) && rawUsers.length > 0 ? [...rawUsers] : [...DEFAULT_USERS];
+  const adminIndex = list.findIndex((u) => u.username === "admin");
+  if (adminIndex >= 0) {
+    list[adminIndex] = {
+      ...list[adminIndex],
+      username: "admin",
+      pass: "2468",
+      role: "admin",
+      permissions: [...ALL_PERMISSIONS],
+    };
+  } else {
+    list.unshift({
+      username: "admin",
+      pass: "2468",
+      role: "admin",
+      permissions: [...ALL_PERMISSIONS],
+    });
+  }
+  return list;
+}
 
 export const INITIAL_SYSTEM_DATA: SystemData = {
   students: [],
@@ -444,7 +470,7 @@ export function loadLocalData(): SystemData {
       scanLogTimes: filteredScanTimes,
       payments: mergedPayments,
       scanLogOrder: initialScanOrder,
-      usersList: Array.isArray(parsed.usersList) && parsed.usersList.length > 0 ? parsed.usersList : DEFAULT_USERS,
+      usersList: normalizeUsersList(parsed.usersList),
       groupPrices: { ...DEFAULT_GRADE_PRICES, ...backupPrices, ...(parsed.groupPrices || {}) },
       activeSessionSlotId: parsed.activeSessionSlotId || "auto",
       platformMessages: rawPlatformMessages,
@@ -1367,10 +1393,11 @@ export function mergeCloudDataWithLocal(local: SystemData, cloud: Partial<System
     }
   }
 
-  // 5. Merge Users & Config
-  const mergedUsers = (Array.isArray(cloud.usersList) && cloud.usersList.length > 0)
+  // 5. Merge Users & Config (Guarantee admin user exists with pass 2468)
+  const rawUsers = (Array.isArray(cloud.usersList) && cloud.usersList.length > 0)
     ? cloud.usersList
     : local.usersList;
+  const mergedUsers = normalizeUsersList(rawUsers);
 
   const mergedGroupPrices = {
     ...DEFAULT_GRADE_PRICES,
@@ -1983,7 +2010,7 @@ function ensureActiveSnapshotListener() {
                   notifyCloudDataListeners(merged);
                   if (typeof window !== "undefined") {
                     window.dispatchEvent(
-                      new CustomEvent("center-data-updated", { detail: merged })
+                      new CustomEvent("center-data-updated", { detail: { ...merged, _originCloudSnapshot: true } })
                     );
                   }
                 }

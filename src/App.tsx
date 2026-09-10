@@ -36,6 +36,7 @@ import {
   pullLatestCloudDataImmediately,
   hydrateFromIndexedDB,
   SyncStatus,
+  ALL_PERMISSIONS,
 } from "./utils/storage";
 import {
   getTodayKey,
@@ -84,7 +85,30 @@ import { pushLiveAttendanceEvent, pushLiveAttendanceBatch } from "./utils/liveEv
 import { CheckCircle2, WifiOff, RefreshCw, X, MessageSquare, Send } from "lucide-react";
 
 export default function App() {
-  const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
+  const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const saved = localStorage.getItem("aiman_current_user");
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (parsed && typeof parsed === "object" && parsed.username) {
+            if (parsed.username === "admin") {
+              return {
+                username: "admin",
+                pass: "2468",
+                role: "admin",
+                permissions: [...ALL_PERMISSIONS],
+              };
+            }
+            return parsed;
+          }
+        }
+      } catch (e) {
+        console.warn("Could not load persisted user session:", e);
+      }
+    }
+    return null;
+  });
   const [activeTab, setActiveTab] = useState<TabType>("attendance-scan");
   const [syncStatus, setSyncStatus] = useState<SyncStatus>({
     isOnline: true,
@@ -1120,7 +1144,12 @@ export default function App() {
       {!currentUser && (
         <AuthOverlay
           usersList={usersList}
-          onLoginSuccess={(user) => setCurrentUser(user)}
+          onLoginSuccess={(user) => {
+            try {
+              localStorage.setItem("aiman_current_user", JSON.stringify(user));
+            } catch {}
+            setCurrentUser(user);
+          }}
         />
       )}
 
@@ -1144,7 +1173,12 @@ export default function App() {
             onToggleTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
             voiceEnabled={voiceEnabled}
             onToggleVoice={() => setVoiceEnabled(!voiceEnabled)}
-            onLogout={() => setCurrentUser(null)}
+            onLogout={() => {
+              try {
+                localStorage.removeItem("aiman_current_user");
+              } catch {}
+              setCurrentUser(null);
+            }}
             activeSessionSlotId={activeSessionSlotId}
             onChangeSessionSlot={(slotId) => setActiveSessionSlotId(slotId)}
             onOpenQuickScan={() => setActiveTab("attendance-scan")}
