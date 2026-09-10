@@ -366,6 +366,31 @@ async function startServer() {
     });
   });
 
+  // 3. Sub-Second Parent Push Notification Webhook / Broadcast Hub
+  app.post("/api/notifications/parent-push", (req: Request, res: Response) => {
+    const payload = req.body || {};
+    const { eventId, parentPhone, studentBarcode, title, body, type, timestamp } = payload;
+
+    // Broadcast to connected SSE subscribers for parents or devices
+    broadcastToUnified({
+      event: "parent_notification",
+      eventId,
+      parentPhone,
+      studentBarcode,
+      title,
+      body,
+      type,
+      timestamp: timestamp || Date.now(),
+    });
+
+    res.json({
+      ok: true,
+      delivered: true,
+      eventId,
+      timestamp: Date.now(),
+    });
+  });
+
   // -------------------------------------------------------------
   // SYSTEM 2: Independent Device APIs (الموقع المستقل - أجهزة الدخول والخروج)
   // -------------------------------------------------------------

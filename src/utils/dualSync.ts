@@ -39,6 +39,12 @@ import {
 import { pushLiveAttendanceEvent, pushLiveAttendanceBatch } from "./liveEventStream";
 import { recordDeviceEntryExitScan } from "./deviceClient";
 import { Student } from "../types";
+import {
+  emitParentNotification,
+  recordTombstone,
+  appendWALRecord,
+  HLCEngine,
+} from "../architecture";
 
 // Safe non-blocking execution wrapper
 function runInBackground(promise: Promise<any>, opName: string) {
@@ -155,6 +161,31 @@ export function dualSyncLiveScan(params: ScanSyncParams) {
       syncToUnifiedAttendance: true,
     }),
     "Device Hub recordDeviceEntryExitScan"
+  );
+
+  // 6️⃣ Sub-Second Parent Instant Push Pipeline & WAL Commit
+  runInBackground(
+    emitParentNotification({
+      studentBarcode: b,
+      studentName: params.name,
+      parentPhone: params.studentFallback?.parentPhone || "",
+      type: normalizedStatus === "تأخير" ? "LATE_ARRIVAL" : "ATTENDANCE_SCAN",
+      title:
+        normalizedStatus === "تأخير"
+          ? `⚠️ تسجيل تأخير: ${params.name}`
+          : `✅ تأكيد حضور: ${params.name}`,
+      body:
+        normalizedStatus === "تأخير"
+          ? `تم تسجيل وصول ودخول الطالب(ة) ${params.name} إلى القاعة متأخراً.`
+          : `تم تسجيل وصول ودخول الطالب(ة) ${params.name} إلى القاعة في الموعد المحدد.`,
+      meta: {
+        dateKey,
+        timeDisplay: params.timeDisplay,
+        status: normalizedStatus,
+      },
+      hlc: HLCEngine.now(),
+    }),
+    "Parent Realtime Pipeline"
   );
 }
 
@@ -395,6 +426,27 @@ export function dualSyncPaymentRecord(params: {
     })(),
     "Firebase payment_records doc"
   );
+
+  // 4️⃣ Sub-Second Parent Digital Receipt Notification
+  if (params.studentFallback?.parentPhone) {
+    runInBackground(
+      emitParentNotification({
+        studentBarcode: b,
+        studentName: params.studentFallback?.name || b,
+        parentPhone: params.studentFallback.parentPhone,
+        type: "PAYMENT_RECEIPT",
+        title: `🧾 إيصال سداد: ${amount} ج.م`,
+        body: `تم استلام مبلغ ${amount} ج.م لسداد اشتراك شهر (${params.monthKey}) للطالب(ة) ${params.studentFallback?.name || b}.`,
+        meta: {
+          dateKey: params.date,
+          amount,
+          monthKey: params.monthKey,
+        },
+        hlc: HLCEngine.now(),
+      }),
+      "Parent Payment Receipt Notification"
+    );
+  }
 }
 
 export function dualSyncPaymentUpdate(params: {
@@ -638,6 +690,12 @@ export function dualSyncStudentSave(student: Student, action: "add" | "update" =
 
 export function dualSyncStudentDelete(barcode: string) {
   const b = String(barcode).trim();
+
+  // 0️⃣ Durable Tombstone to prevent Zombie Resurrection
+  runInBackground(
+    recordTombstone("STUDENT", b, "admin", "User deleted student"),
+    "Record durable tombstone"
+  );
 
   // 1️⃣ Supabase Realtime broadcast
   runInBackground(
