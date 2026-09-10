@@ -1067,6 +1067,7 @@ export async function flushPendingSyncToCloud(forceManual: boolean = false): Pro
       lastRecordedCompressionRatio = compression.compressionRatio;
 
       docPayload = {
+        ...(cleaned as Record<string, unknown>),
         _compressedPayload: compression.compressedString,
         _compressionStats: {
           originalKB: compression.originalSizeKB,

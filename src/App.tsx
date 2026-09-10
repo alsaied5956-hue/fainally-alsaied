@@ -42,20 +42,26 @@ import {
   getCurrentMonthKey,
   formatArabicDate,
   formatTimeArabic,
+  isStudentPaid,
 } from "./utils/helpers";
 import {
-  broadcastGroupFinished,
-  broadcastPaymentChange,
-  broadcastStudentChange,
   subscribeToGroupFinished,
   subscribeToPaymentChanges,
   subscribeToStudentChanges,
-  saveBulkAttendanceToSupabase,
-  savePaymentToSupabase,
-  deletePaymentFromSupabase,
-  saveStudentToSupabase,
-  deleteStudentFromSupabase,
+  subscribeToExamGradeChanges,
 } from "./utils/supabaseClient";
+import {
+  dualSyncLiveScan,
+  dualSyncGroupFinished,
+  dualSyncAttendanceStatusChange,
+  dualSyncPaymentRecord,
+  dualSyncPaymentUpdate,
+  dualSyncPaymentDelete,
+  dualSyncExamGrade,
+  dualSyncStudentSave,
+  dualSyncStudentDelete,
+  dualSyncBulkStudents,
+} from "./utils/dualSync";
 import { Navbar } from "./components/Navbar";
 import { Sidebar } from "./components/Sidebar";
 import { AttendanceScanner } from "./components/AttendanceScanner";
@@ -434,10 +440,32 @@ export default function App() {
       }
     });
 
+    const unsubExamGrade = subscribeToExamGradeChanges((payload) => {
+      setStudents((prev) =>
+        prev.map((s) => {
+          if (s.barcode === payload.barcode) {
+            const pct = payload.percentage;
+            const scoreFormatted = `${payload.score}/${payload.maxScore} (${pct}%)`;
+            const scores = s.totalExamScores ? [...s.totalExamScores, pct] : [pct];
+            const pointsBonus = pct === 100 ? 20 : pct >= 90 ? 10 : pct >= 75 ? 5 : 0;
+            return {
+              ...s,
+              lastExamTitle: payload.examTitle,
+              lastExamScore: scoreFormatted,
+              totalExamScores: scores,
+              points: (s.points || 0) + pointsBonus,
+            };
+          }
+          return s;
+        })
+      );
+    });
+
     return () => {
       unsubGroup();
       unsubPayment();
       unsubStudent();
+      unsubExamGrade();
     };
   }, []);
 
@@ -481,12 +509,23 @@ export default function App() {
     setScanLogOrder(updatedOrder);
     setScanLogTimes(updatedTimes);
 
-    // 1️⃣ Live Event Pipeline: Instant broadcast via local zero-quota channel
-    pushLiveAttendanceEvent(barcode, status, Date.now(), false);
+    // ⚡ Dual-Sync to Firebase and Supabase immediately
+    dualSyncLiveScan({
+      barcode,
+      name: student.name,
+      grade: student.groupGrade,
+      days: student.groupDays,
+      status,
+      timeIso,
+      timeDisplay: new Date(timeIso).toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" }),
+      isPaid: isStudentPaid(payments?.[getCurrentMonthKey()], barcode),
+      scannedBy: currentUser?.username || "الماسح",
+      studentFallback: student,
+    });
 
-    // Instant local save with 0 cloud writes; entire group attendance is synced as ONE single operation
+    // Instant local save with batching
     saveAttendanceAndStudentsBatch(updatedToday, updatedOrder, updatedTimes, updatedStudents, false, true);
-  }, [attendanceToday, attendanceHistory, scanLogOrder, scanLogTimes, students]);
+  }, [attendanceToday, attendanceHistory, scanLogOrder, scanLogTimes, students, payments, currentUser]);
 
   // Handler: Manual sync for group attendance session in one single operation
   const handleSyncGroupSession = useCallback(async () => {
@@ -599,8 +638,8 @@ export default function App() {
     // Save and immediately sync to cloud and local storage
     saveAttendanceAndStudentsBatch(updatedToday, remainingScanOrder, remainingScanTimes, updatedStudents, true);
 
-    // ⚡ Supabase Realtime Hub: Broadcast Group Finalized to ALL assistant screens in <20ms
-    broadcastGroupFinished({
+    // ⚡ Dual-Sync Group Finalization to Firebase and Supabase
+    dualSyncGroupFinished({
       grade,
       days,
       absentBarcodes: Array.from(absentBarcodes),
@@ -610,22 +649,8 @@ export default function App() {
         .filter((b) => !absentBarcodes.has(b) && !lateBarcodes.has(b)),
       dateKey: todayKey,
       finishedBy: currentUser?.username || "الماسح",
-      timestamp: Date.now(),
-    }).catch(console.warn);
-
-    // ⚡ Supabase Direct Persistence: Bulk save all attendance statuses in parallel
-    const bulkAttendanceRecords = groupStudents.map((s) => {
-      const b = String(s.barcode).trim();
-      const st = absentBarcodes.has(b) ? "غياب" : lateBarcodes.has(b) ? "تأخير" : "حضور";
-      return {
-        barcode: b,
-        studentName: s.name,
-        status: st as "حضور" | "تأخير" | "غياب",
-        dateKey: todayKey,
-        scannedBy: currentUser?.username || "admin",
-      };
+      allStudents: groupStudents,
     });
-    saveBulkAttendanceToSupabase(bulkAttendanceRecords).catch(console.warn);
   }, [students, attendanceToday, attendanceHistory, scanLogOrder, scanLogTimes, currentUser]);
 
   // Handler: Remove single student from active scanner screen
@@ -660,15 +685,8 @@ export default function App() {
     setStudents(updated);
     saveStudentsData(updated);
 
-    // ⚡ Supabase Realtime: Broadcast new student across all assistant devices
-    broadcastStudentChange({
-      action: "add",
-      barcode: newStudent.barcode,
-      studentData: newStudent,
-      timestamp: Date.now(),
-    }).catch(console.warn);
-
-    saveStudentToSupabase(newStudent).catch(console.warn);
+    // ⚡ Dual-Sync: Supabase + Firebase
+    dualSyncStudentSave(newStudent, "add");
 
     if (cardFee > 0) {
       const today = getTodayKey();
@@ -694,6 +712,17 @@ export default function App() {
       };
       setPayments(updatedPayments);
       savePaymentsData(updatedPayments);
+
+      dualSyncPaymentRecord({
+        barcode: newStudent.barcode,
+        monthKey,
+        amount: cardFee,
+        date: today,
+        time: newPayment.time,
+        note: newPayment.note,
+        recordedBy: currentUser?.username || "admin",
+        studentFallback: newStudent,
+      });
     }
   }, [students, payments, currentUser]);
 
@@ -708,6 +737,9 @@ export default function App() {
     const updated = [...newStudentsList, ...students];
     setStudents(updated);
     saveStudentsData(updated);
+
+    // ⚡ Dual-Sync Bulk Students to Firebase & Supabase
+    dualSyncBulkStudents(newStudentsList);
   }, [students]);
 
   // Handler: Update Student Info (with full barcode migration)
@@ -735,19 +767,13 @@ export default function App() {
       setScanLogTimes(newScanTimes);
 
       saveAttendanceAndStudentsBatch(newAttToday, newScanOrder, newScanTimes, updated);
+
+      dualSyncStudentDelete(oldBarcode);
+      dualSyncStudentSave(updatedStudent, "add");
     } else {
       saveStudentsData(updated);
+      dualSyncStudentSave(updatedStudent, "update");
     }
-
-    // ⚡ Supabase Realtime: Broadcast student update
-    broadcastStudentChange({
-      action: "update",
-      barcode: updatedStudent.barcode,
-      studentData: updatedStudent,
-      timestamp: Date.now(),
-    }).catch(console.warn);
-
-    saveStudentToSupabase(updatedStudent).catch(console.warn);
   }, [students, attendanceToday, scanLogOrder, scanLogTimes]);
 
   // Handler: Delete Single Student
@@ -756,14 +782,8 @@ export default function App() {
     setStudents(updated);
     saveStudentsData(updated, barcode);
 
-    // ⚡ Supabase Realtime: Broadcast student deletion
-    broadcastStudentChange({
-      action: "delete",
-      barcode,
-      timestamp: Date.now(),
-    }).catch(console.warn);
-
-    deleteStudentFromSupabase(barcode).catch(console.warn);
+    // ⚡ Dual-Sync Delete Student from Supabase & Firebase
+    dualSyncStudentDelete(barcode);
   }, [students]);
 
   // Handler: Clear All Data
@@ -832,7 +852,17 @@ export default function App() {
     } else {
       saveAttendanceHistoryData(updatedHistory, updatedStudents);
     }
-  }, [attendanceToday, attendanceHistory, scanLogOrder, scanLogTimes, students]);
+
+    const studentObj = students.find((s) => s.barcode === barcode);
+    dualSyncAttendanceStatusChange({
+      barcode,
+      studentName: studentObj?.name || `طالب ${barcode}`,
+      status: newStatus,
+      dateKey,
+      updatedBy: currentUser?.username || "admin",
+      studentFallback: studentObj,
+    });
+  }, [attendanceToday, attendanceHistory, scanLogOrder, scanLogTimes, students, currentUser]);
 
   // Handler: Record Payment
   const handleRecordPayment = useCallback((
@@ -867,9 +897,8 @@ export default function App() {
     setPayments(updatedPayments);
     savePaymentsData(updatedPayments);
 
-    // ⚡ Supabase Realtime: Broadcast Payment to all assistant devices in <20ms
-    broadcastPaymentChange({
-      action: "record",
+    // ⚡ Dual-Sync Payment to Firebase and Supabase
+    dualSyncPaymentRecord({
       barcode,
       monthKey,
       amount,
@@ -877,19 +906,9 @@ export default function App() {
       time,
       note: note || `اشتراك شهر ${monthKey}`,
       recordedBy: currentUser?.username || "admin",
-      timestamp: Date.now(),
-    }).catch(console.warn);
-
-    // ⚡ Supabase Direct Persistence: Save payment
-    savePaymentToSupabase({
-      barcode,
-      monthKey,
-      amount,
-      date: today,
-      note,
-      recordedBy: currentUser?.username || "admin",
-    }).catch(console.warn);
-  }, [payments, currentUser]);
+      studentFallback: students.find((s) => s.barcode === barcode),
+    });
+  }, [payments, currentUser, students]);
 
   // Handler: Update / Move Payment (e.g. change month from 8 to 9, or correct amount/notes)
   const handleUpdatePayment = useCallback((
@@ -931,28 +950,18 @@ export default function App() {
     setPayments(updatedPayments);
     savePaymentsData(updatedPayments);
 
-    // ⚡ Supabase Realtime: Broadcast payment update to all devices in <20ms
-    broadcastPaymentChange({
-      action: "update",
+    // ⚡ Dual-Sync Payment Update to Firebase and Supabase
+    dualSyncPaymentUpdate({
+      oldMonthKey,
+      newMonthKey,
       barcode,
-      monthKey: newMonthKey,
-      amount: newAmount,
-      date: newDate || existing?.date || today,
-      time: existing?.time || time,
-      note: newNote || `اشتراك شهر ${newMonthKey}`,
+      newAmount,
+      newNote,
+      newDate: newDate || existing?.date || today,
       recordedBy: existing?.recordedBy || currentUser?.username || "admin",
-      timestamp: Date.now(),
-    }).catch(console.warn);
-
-    savePaymentToSupabase({
-      barcode,
-      monthKey: newMonthKey,
-      amount: newAmount,
-      date: newDate || existing?.date || today,
-      note: newNote,
-      recordedBy: existing?.recordedBy || currentUser?.username || "admin",
-    }).catch(console.warn);
-  }, [payments, currentUser]);
+      studentFallback: students.find((s) => s.barcode === barcode),
+    });
+  }, [payments, currentUser, students]);
 
   // Handler: Delete Payment (revert student to unpaid for this month)
   const handleDeletePayment = useCallback((monthKey: string, barcode: string) => {
@@ -966,20 +975,11 @@ export default function App() {
     setPayments(updatedPayments);
     savePaymentsData(updatedPayments);
 
-    // ⚡ Supabase Realtime: Broadcast payment deletion
-    broadcastPaymentChange({
-      action: "delete",
+    // ⚡ Dual-Sync Payment Deletion from Firebase and Supabase
+    dualSyncPaymentDelete({
       barcode,
       monthKey,
-      amount: 0,
-      date: "",
-      time: "",
-      note: "",
-      recordedBy: "",
-      timestamp: Date.now(),
-    }).catch(console.warn);
-
-    deletePaymentFromSupabase(barcode, monthKey).catch(console.warn);
+    });
   }, [payments]);
 
   // Handler: Record Exam Grade
@@ -992,6 +992,7 @@ export default function App() {
     const pct = Math.round((score / maxScore) * 100);
     const scoreFormatted = `${score}/${maxScore} (${pct}%)`;
 
+    const targetStudent = students.find((s) => s.barcode === barcode);
     const updated = students.map((s) => {
       if (s.barcode === barcode) {
         const scores = s.totalExamScores ? [...s.totalExamScores, pct] : [pct];
@@ -1010,16 +1011,30 @@ export default function App() {
 
     setStudents(updated);
     saveStudentsData(updated);
-  }, [students]);
+
+    // ⚡ Dual-Sync Exam Grade to Firebase and Supabase
+    dualSyncExamGrade({
+      barcode,
+      studentName: targetStudent?.name,
+      examTitle,
+      score,
+      maxScore,
+      percentage: pct,
+      notes: `رصد درجة امتحان: ${examTitle} (${scoreFormatted})`,
+      recordedBy: currentUser?.username || "admin",
+      studentFallback: targetStudent,
+    });
+  }, [students, currentUser]);
 
   // Handler: Update Grade Record from Cumulative Table
-  const handleUpdateGradeRecord = (
+  const handleUpdateGradeRecord = useCallback((
     barcode: string,
     lastTitle: string,
     lastScore: string,
     newPoints: number,
     updatedScores: number[]
   ) => {
+    const targetStudent = students.find((s) => s.barcode === barcode);
     const updated = students.map((s) => {
       if (s.barcode === barcode) {
         return {
@@ -1034,7 +1049,23 @@ export default function App() {
     });
     setStudents(updated);
     saveStudentsData(updated);
-  };
+
+    const match = lastScore.match(/^(\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)/);
+    const score = match ? parseFloat(match[1]) : 100;
+    const maxScore = match ? parseFloat(match[2]) : 100;
+
+    // ⚡ Dual-Sync Exam Grade modification to Firebase and Supabase
+    dualSyncExamGrade({
+      barcode,
+      studentName: targetStudent?.name,
+      examTitle: lastTitle,
+      score,
+      maxScore,
+      notes: `تعديل رصد درجة: ${lastTitle} (${lastScore})`,
+      recordedBy: currentUser?.username || "admin",
+      studentFallback: targetStudent,
+    });
+  }, [students, currentUser]);
 
   // Handler: Manage Users
   const handleAddUser = (newUser: UserAccount) => {

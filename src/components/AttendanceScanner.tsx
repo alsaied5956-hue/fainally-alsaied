@@ -16,9 +16,8 @@ import { playBeep, speakArabicGreeting } from "../utils/audio";
 import { StudentSearchBox } from "./StudentSearchBox";
 import { enqueuePlatformMessagesBatch, flushPendingSyncToCloud } from "../utils/storage";
 import { pushLiveAttendanceEvent } from "../utils/liveEventStream";
+import { dualSyncLiveScan } from "../utils/dualSync";
 import {
-  broadcastLiveScan,
-  saveAttendanceToSupabase,
   subscribeToLiveScans,
   LiveScanPayload,
 } from "../utils/supabaseClient";
@@ -313,33 +312,20 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
 
     if (onRecordAttendance) {
       onRecordAttendance(student.barcode, calculatedStatus, now.toISOString(), student);
+    } else {
+      dualSyncLiveScan({
+        barcode: student.barcode,
+        name: student.name,
+        grade: student.groupGrade,
+        days: student.groupDays,
+        status: calculatedStatus,
+        timeIso: now.toISOString(),
+        timeDisplay: nowTimeStr,
+        isPaid,
+        scannedBy: "الماسح السريع",
+        studentFallback: student,
+      });
     }
-
-    // 1️⃣ Live Event Pipeline: Instant broadcast to Firestore path `live_events/today`
-    pushLiveAttendanceEvent(student.barcode, calculatedStatus, now.getTime());
-
-    // ⚡ Supabase Realtime: Instant broadcast across all assistant screens in <20ms
-    broadcastLiveScan({
-      barcode: student.barcode,
-      name: student.name,
-      grade: student.groupGrade,
-      days: student.groupDays,
-      status: calculatedStatus,
-      timeIso: now.toISOString(),
-      timeDisplay: nowTimeStr,
-      isPaid,
-      scannedBy: "الماسح السريع",
-      timestamp: Date.now(),
-    }).catch(console.warn);
-
-    // ⚡ Supabase Direct Persistence (Zero quota limitations, sub-5ms)
-    saveAttendanceToSupabase({
-      barcode: student.barcode,
-      studentName: student.name,
-      status: calculatedStatus,
-      timeIso: now.toISOString(),
-      scannedBy: "admin",
-    }).catch(console.warn);
 
     playBeep("success");
     speakArabicGreeting(student.name, voiceEnabled);
