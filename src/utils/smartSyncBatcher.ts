@@ -203,15 +203,6 @@ export async function flushSmartBatchToFirestore(latestSystemData?: any): Promis
     // Avoid creating unnecessary dummy documents in batch_operations to preserve Firestore free tier quota
 
     // 2. If system state snapshot is provided or cached, compress and include in batch
-    if (!latestSystemData && typeof window !== "undefined") {
-      try {
-        const raw = localStorage.getItem("aiman_system_data_v3") || localStorage.getItem("center_data");
-        if (raw) {
-          latestSystemData = JSON.parse(raw);
-        }
-      } catch {}
-    }
-
     if (latestSystemData) {
       const systemDocRef = doc(db, "system_state", "main_center_data");
       try {
@@ -228,16 +219,13 @@ export async function flushSmartBatchToFirestore(latestSystemData?: any): Promis
           syncedAtIso: new Date().toISOString(),
         }, { merge: true });
       }
-
-      // Commit atomic batch to Firestore with safe timeout and timer cleanup
-      await safeWithTimeout(batch.commit(), 25000, "انتهت مهلة إرسال الحزمة السحابية");
     }
 
-    // Remove committed operations from queue and prevent memory explosion
+    // Commit atomic batch to Firestore with safe timeout and timer cleanup
+    await safeWithTimeout(batch.commit(), 25000, "انتهت مهلة إرسال الحزمة السحابية");
+
+    // Remove committed operations from queue
     inMemoryQueue = inMemoryQueue.filter((o) => !chunkIds.includes(o.id));
-    if (inMemoryQueue.length > 200) {
-      inMemoryQueue = inMemoryQueue.slice(-100);
-    }
     persistQueueLocally();
     removeOperationsFromIndexedDB(chunkIds).catch(() => {});
 

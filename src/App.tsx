@@ -36,7 +36,6 @@ import {
   pullLatestCloudDataImmediately,
   hydrateFromIndexedDB,
   SyncStatus,
-  ALL_PERMISSIONS,
 } from "./utils/storage";
 import {
   getTodayKey,
@@ -85,57 +84,7 @@ import { pushLiveAttendanceEvent, pushLiveAttendanceBatch } from "./utils/liveEv
 import { CheckCircle2, WifiOff, RefreshCw, X, MessageSquare, Send } from "lucide-react";
 
 export default function App() {
-  const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => {
-    if (typeof window !== "undefined") {
-      try {
-        // If user explicitly pressed "تسجيل الخروج", respect logout until they sign in again
-        const isExplicitlyLoggedOut = localStorage.getItem("aiman_user_logged_out") === "true";
-        if (isExplicitlyLoggedOut) {
-          return null;
-        }
-
-        const saved =
-          localStorage.getItem("aiman_current_user") ||
-          sessionStorage.getItem("aiman_current_user");
-        if (saved) {
-          const parsed = JSON.parse(saved);
-          if (parsed && typeof parsed === "object" && parsed.username) {
-            if (parsed.username === "admin") {
-              return {
-                username: "admin",
-                pass: "2468",
-                role: "admin",
-                permissions: [...ALL_PERMISSIONS],
-              };
-            }
-            return parsed;
-          }
-        }
-
-        // Guaranteed persistent supervisor account on all devices & across page reloads
-        const defaultSupervisor: UserAccount = {
-          username: "admin",
-          pass: "2468",
-          role: "admin",
-          permissions: [...ALL_PERMISSIONS],
-        };
-
-        try {
-          localStorage.setItem("aiman_current_user", JSON.stringify(defaultSupervisor));
-          sessionStorage.setItem("aiman_current_user", JSON.stringify(defaultSupervisor));
-        } catch {}
-        return defaultSupervisor;
-      } catch (e) {
-        console.warn("Could not load persisted user session:", e);
-      }
-    }
-    return {
-      username: "admin",
-      pass: "2468",
-      role: "admin",
-      permissions: [...ALL_PERMISSIONS],
-    };
-  });
+  const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
   const [activeTab, setActiveTab] = useState<TabType>("attendance-scan");
   const [syncStatus, setSyncStatus] = useState<SyncStatus>({
     isOnline: true,
@@ -1171,14 +1120,7 @@ export default function App() {
       {!currentUser && (
         <AuthOverlay
           usersList={usersList}
-          onLoginSuccess={(user) => {
-            try {
-              localStorage.removeItem("aiman_user_logged_out");
-              localStorage.setItem("aiman_current_user", JSON.stringify(user));
-              sessionStorage.setItem("aiman_current_user", JSON.stringify(user));
-            } catch {}
-            setCurrentUser(user);
-          }}
+          onLoginSuccess={(user) => setCurrentUser(user)}
         />
       )}
 
@@ -1202,14 +1144,7 @@ export default function App() {
             onToggleTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
             voiceEnabled={voiceEnabled}
             onToggleVoice={() => setVoiceEnabled(!voiceEnabled)}
-            onLogout={() => {
-              try {
-                localStorage.setItem("aiman_user_logged_out", "true");
-                localStorage.removeItem("aiman_current_user");
-                sessionStorage.removeItem("aiman_current_user");
-              } catch {}
-              setCurrentUser(null);
-            }}
+            onLogout={() => setCurrentUser(null)}
             activeSessionSlotId={activeSessionSlotId}
             onChangeSessionSlot={(slotId) => setActiveSessionSlotId(slotId)}
             onOpenQuickScan={() => setActiveTab("attendance-scan")}

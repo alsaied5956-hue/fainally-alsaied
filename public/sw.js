@@ -35,11 +35,9 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const request = event.request;
 
-  // Don't intercept non-GET requests, API calls, or cloud/realtime endpoints
+  // Don't intercept non-GET requests or Firebase/Google API cloud calls
   if (
     request.method !== "GET" ||
-    request.url.includes("/api/") ||
-    request.url.includes("supabase.co") ||
     request.url.includes("firestore.googleapis.com") ||
     request.url.includes("firebaseapp.com") ||
     request.url.includes("identitytoolkit.googleapis.com") ||
@@ -51,13 +49,8 @@ self.addEventListener("fetch", (event) => {
   event.respondWith(
     fetch(request)
       .then((networkResponse) => {
-        // Only cache successful same-origin static resources
-        if (
-          networkResponse &&
-          networkResponse.status === 200 &&
-          request.url.startsWith(self.location.origin) &&
-          !request.url.includes("/api/")
-        ) {
+        // If response is valid, update cache in background
+        if (networkResponse && networkResponse.status === 200) {
           const responseToCache = networkResponse.clone();
           caches.open(CACHE_NAME).then((cache) => {
             cache.put(request, responseToCache).catch(() => {});
