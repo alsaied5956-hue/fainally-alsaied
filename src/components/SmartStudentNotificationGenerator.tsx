@@ -1,8 +1,12 @@
 import React, { useState, useMemo } from "react";
 import { Student, PaymentRecord, PlatformMessageType } from "../types";
-import { getTodayKey, getCurrentMonthKey } from "../utils/helpers";
+import { getTodayKey, getCurrentMonthKey, openWhatsApp } from "../utils/helpers";
 import { enqueuePlatformMessage } from "../utils/storage";
 import { StudentSearchBox } from "./StudentSearchBox";
+import {
+  requestSmartNotification,
+  SmartNotificationResult,
+} from "../utils/aiClient";
 import {
   Sparkles,
   Search,
@@ -21,6 +25,8 @@ import {
   QrCode,
   Layers,
   ChevronRight,
+  RotateCw,
+  MessageSquare,
 } from "lucide-react";
 
 export interface GeneratedStudentNotifications {
@@ -187,7 +193,30 @@ export const SmartStudentNotificationGenerator: React.FC<
   const [barcodeInput, setBarcodeInput] = useState("");
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [sentKey, setSentKey] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<"all" | "report">("all");
+  const [activeTab, setActiveTab] = useState<"all" | "report" | "ai">("all");
+
+  // Gemini AI Message Generation State
+  const [aiTheme, setAiTheme] = useState<string>("تشجيع وتفوق");
+  const [aiCustomContext, setAiCustomContext] = useState<string>("");
+  const [aiLoading, setAiLoading] = useState<boolean>(false);
+  const [aiResult, setAiResult] = useState<SmartNotificationResult | null>(null);
+
+  const handleGenerateAiMessage = async () => {
+    if (!selectedStudent) return;
+    setAiLoading(true);
+    try {
+      const result = await requestSmartNotification({
+        student: selectedStudent,
+        messageType: aiTheme,
+        contextData: aiCustomContext,
+      });
+      setAiResult(result);
+    } catch (err) {
+      console.warn("Error generating AI message:", err);
+    } finally {
+      setAiLoading(false);
+    }
+  };
 
   const generated = useMemo(() => {
     if (!selectedStudent) return null;
@@ -362,6 +391,18 @@ export const SmartStudentNotificationGenerator: React.FC<
           </button>
           <button
             type="button"
+            onClick={() => setActiveTab("ai")}
+            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+              activeTab === "ai"
+                ? "bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-md shadow-purple-600/30"
+                : "text-amber-300 hover:text-white"
+            }`}
+          >
+            <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+            <span>صياغة الذكاء الاصطناعي (Gemini) ✨</span>
+          </button>
+          <button
+            type="button"
             onClick={() => setActiveTab("report")}
             className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${
               activeTab === "report"
@@ -452,7 +493,149 @@ export const SmartStudentNotificationGenerator: React.FC<
 
       {/* Generated Cards Container */}
       {selectedStudent && generated ? (
-        activeTab === "report" ? (
+        activeTab === "ai" ? (
+          /* Gemini AI Customized Message Workshop */
+          <div className="p-6 rounded-3xl bg-indigo-950/20 border border-indigo-500/40 space-y-5 shadow-xl">
+            <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-indigo-500/20">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-xl bg-purple-500/20 text-purple-300">
+                  <Sparkles className="w-5 h-5 text-amber-300" />
+                </div>
+                <div>
+                  <h4 className="text-sm font-bold text-white font-fancy">
+                    ورشة الصياغة الذكية لرسائل المتابعة (Gemini 3.8 Flash)
+                  </h4>
+                  <p className="text-xs text-indigo-300">
+                    توليد رسائل تربوية دقيقة مراعية لشخصية الطالب وأدائه
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Controls */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-300">طابع / هدف الرسالة:</label>
+                <select
+                  value={aiTheme}
+                  onChange={(e) => setAiTheme(e.target.value)}
+                  className="w-full bg-[#080d1e] border border-indigo-500/30 text-white text-xs font-bold px-3.5 py-2.5 rounded-xl outline-none"
+                >
+                  <option value="تشجيع وتفوق">تشجيع وتفوق 🌟</option>
+                  <option value="تنبيه غياب">تنبيه غياب وتأخر ⚠️</option>
+                  <option value="متابعة درجات">متابعة درجات واختبارات 📐</option>
+                  <option value="تذكير بالاشتراك">تذكير بالاشتراك الشهري 💳</option>
+                  <option value="ملاحظة خاصة">ملاحظة سلوكية وتربوية 🌸</option>
+                </select>
+              </div>
+
+              <div className="md:col-span-2 space-y-1.5">
+                <label className="text-xs font-bold text-slate-300">
+                  سياق إضافي أو ملاحظة تريد تضمينها (اختياري):
+                </label>
+                <input
+                  type="text"
+                  value={aiCustomContext}
+                  onChange={(e) => setAiCustomContext(e.target.value)}
+                  placeholder="مثال: نريد التركيز على حل مسائل الهندسة، أو تحسن ملحوظ في التفاعل..."
+                  className="w-full bg-[#080d1e] border border-indigo-500/30 text-white text-xs px-3.5 py-2.5 rounded-xl outline-none focus:border-amber-400 font-medium"
+                />
+              </div>
+            </div>
+
+            <button
+              type="button"
+              disabled={aiLoading}
+              onClick={handleGenerateAiMessage}
+              className="px-6 py-3 rounded-2xl bg-gradient-to-r from-indigo-600 via-purple-600 to-indigo-700 hover:from-indigo-500 hover:to-purple-500 text-white text-xs font-bold flex items-center gap-2 shadow-lg shadow-purple-600/30 cursor-pointer disabled:opacity-50 transition-all"
+            >
+              {aiLoading ? (
+                <>
+                  <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  <span>جارٍ التوليد عبر Gemini AI...</span>
+                </>
+              ) : (
+                <>
+                  <Sparkles className="w-4 h-4 text-amber-300" />
+                  <span>توليد الرسالة الآن بالذكاء الاصطناعي ✨</span>
+                </>
+              )}
+            </button>
+
+            {/* Generated AI Message Display */}
+            {aiResult && (
+              <div className="p-4 rounded-2xl bg-slate-950/90 border border-indigo-500/40 space-y-3 animate-fadeIn">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-2.5">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-bold text-amber-400">{aiResult.title}</span>
+                    <span className="text-[11px] px-2 py-0.5 rounded-lg bg-indigo-900/50 text-indigo-300 border border-indigo-500/30">
+                      النبرة: {aiResult.tone}
+                    </span>
+                    {aiResult.isFallback && (
+                      <span className="text-[10px] px-2 py-0.5 rounded-lg bg-slate-800 text-slate-300">
+                        نموذج قواعد آمن
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleCopy("ai_msg", aiResult.formattedMessage)}
+                      className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                    >
+                      {copiedKey === "ai_msg" ? (
+                        <>
+                          <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>تم النسخ!</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5" />
+                          <span>نسخ</span>
+                        </>
+                      )}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        openWhatsApp(
+                          selectedStudent.parentPhone || selectedStudent.phone || "",
+                          aiResult.formattedMessage
+                        );
+                      }}
+                      className="px-3.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-md shadow-emerald-600/30"
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                      <span>إرسال واتساب 📲</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handlePublishPlatformNotification(
+                          "ai_msg",
+                          aiResult.title,
+                          aiResult.formattedMessage,
+                          "عام"
+                        )
+                      }
+                      className="px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-md"
+                    >
+                      <MessageSquare className="w-3.5 h-3.5" />
+                      <span>نشر بالمنصة</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="p-3.5 rounded-xl bg-[#080d1e] border border-indigo-500/20 text-slate-100 text-xs font-mono whitespace-pre-wrap leading-relaxed">
+                  {aiResult.formattedMessage}
+                </div>
+              </div>
+            )}
+          </div>
+        ) : activeTab === "report" ? (
           /* Single Comprehensive Report Display */
           <div className="p-6 rounded-3xl bg-indigo-950/30 border border-indigo-500/40 space-y-4">
             <div className="flex items-center justify-between">

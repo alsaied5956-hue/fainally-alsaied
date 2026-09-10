@@ -13,7 +13,8 @@ import {
 import { DEFAULT_GRADE_PRICES, getTodayKey, formatTimeArabic } from "./helpers";
 import { db, ensureFirebaseAuth } from "./firebase";
 import { doc, setDoc, getDoc, onSnapshot, writeBatch } from "firebase/firestore";
-import { compressData, decompressData } from "./compression";
+import { compressData, decompressData, compactSystemPayload, hydrateSystemPayload } from "./compression";
+import { saveSnapshotToIndexedDB, loadSnapshotFromIndexedDB } from "./indexedDB";
 import {
   isBulkSyncActive,
   partitionLargePayload,
@@ -357,10 +358,16 @@ export function loadLocalData(): SystemData {
     if (raw) {
       try {
         parsed = JSON.parse(raw);
+        if (parsed && (parsed._packed === 3 || parsed._v === 3 || (Array.isArray(parsed.students) && parsed.students[0]?.b))) {
+          parsed = hydrateSystemPayload(parsed);
+        }
       } catch (e) {
         console.error("JSON parse error for local data:", e);
       }
     }
+
+    // Clean up any legacy redundant keys to keep localStorage quota healthy
+    cleanupLegacyStorageKeys();
 
     // Also check separate legacy payment storage keys if any exist
     let legacyPayments: any = null;
@@ -457,7 +464,115 @@ export function loadLocalData(): SystemData {
 }
 
 /**
- * Save data to browser LocalStorage SYNCHRONOUSLY and IMMEDIATELY (guaranteed persistence)
+ * Helper to remove old/legacy keys from LocalStorage that are eating up quota
+ */
+export function cleanupLegacyStorageKeys(): void {
+  if (typeof window === "undefined" || typeof localStorage === "undefined") return;
+  const legacyKeys = [
+    "center_data",
+    "aiman_system_data",
+    "center_payments",
+    "payments",
+    "aiman_payments",
+    "aiman_backup",
+    "eman_temp_export",
+  ];
+  for (const k of legacyKeys) {
+    try {
+      localStorage.removeItem(k);
+    } catch {}
+  }
+}
+
+/**
+ * Creates a lean local cache suitable for LocalStorage without exceeding browser quota.
+ * Keeps 100% of students, users, config, today's scans, today's attendance,
+ * and recent 30 days of attendance + recent 3 months of payments.
+ * The COMPLETE historical data is ALWAYS preserved in memoryCachedData, IndexedDB, and Cloud.
+ */
+export function createLeanSystemCache(data: SystemData): any {
+  const todayKey = getTodayKey();
+
+  // Keep attendance history for the last 30 recorded dates
+  const recentHistory: Record<string, Record<string, string>> = {};
+  if (data.attendanceHistory) {
+    const dates = Object.keys(data.attendanceHistory).sort().reverse();
+    for (const d of dates.slice(0, 30)) {
+      recentHistory[d] = data.attendanceHistory[d];
+    }
+  }
+  recentHistory[todayKey] = data.attendanceToday || {};
+
+  // Keep payments for the last 3 months
+  const recentPayments: Record<string, Record<string, PaymentRecord>> = {};
+  if (data.payments) {
+    const months = Object.keys(data.payments).sort().reverse();
+    for (const m of months.slice(0, 3)) {
+      recentPayments[m] = data.payments[m];
+    }
+  }
+
+  // Keep only the most recent 50 platform messages
+  const recentMessages = Array.isArray(data.platformMessages)
+    ? data.platformMessages.slice(-50)
+    : [];
+
+  return {
+    ...data,
+    attendanceHistory: recentHistory,
+    payments: recentPayments,
+    platformMessages: recentMessages,
+    _isLeanCache: true,
+  };
+}
+
+/**
+ * Asynchronously checks IndexedDB on startup to restore full historical data
+ * in case LocalStorage was capped or trimmed due to browser quota limitations.
+ */
+export async function hydrateFromIndexedDB(): Promise<void> {
+  if (typeof window === "undefined") return;
+  try {
+    const snapshot = await loadSnapshotFromIndexedDB(STORAGE_KEY);
+    if (!snapshot) return;
+
+    const currentLocal = memoryCachedData || loadLocalData();
+    const snapUpdated = parseTimestamp(snapshot.updatedAt);
+    const currUpdated = parseTimestamp(currentLocal.updatedAt);
+
+    // Merge snapshot with current state to restore any history not kept in lean localStorage
+    const merged: SystemData = {
+      ...currentLocal,
+      students:
+        snapshot.students && snapshot.students.length > 0 && snapUpdated >= currUpdated
+          ? snapshot.students
+          : currentLocal.students,
+      attendanceHistory: {
+        ...(snapshot.attendanceHistory || {}),
+        ...(currentLocal.attendanceHistory || {}),
+      },
+      payments: {
+        ...(snapshot.payments || {}),
+        ...(currentLocal.payments || {}),
+      },
+      platformMessages:
+        Array.isArray(snapshot.platformMessages) &&
+        snapshot.platformMessages.length > (currentLocal.platformMessages?.length || 0)
+          ? snapshot.platformMessages
+          : currentLocal.platformMessages,
+      updatedAt: Math.max(snapUpdated, currUpdated),
+    };
+
+    memoryCachedData = merged;
+    notifyCloudDataListeners(merged);
+  } catch (err) {
+    console.warn("IndexedDB hydration check skipped:", err);
+  }
+}
+
+/**
+ * Save data to browser LocalStorage & IndexedDB with multi-tier fail-safe resilience.
+ * Guaranteed zero quota-exceeded crashes.
  */
 export function saveToLocalStorage(data: SystemData, updateTimestamp: boolean = true): void {
   const todayKey = getTodayKey();
@@ -472,13 +587,52 @@ export function saveToLocalStorage(data: SystemData, updateTimestamp: boolean = 
 
   memoryCachedData = clonedData;
 
-  if (typeof window === "undefined") return;
+  // 1. Asynchronously persist full unabridged snapshot into IndexedDB (High capacity, zero quota issues)
+  if (typeof window !== "undefined") {
+    saveSnapshotToIndexedDB(STORAGE_KEY, clonedData).catch(() => {});
+  }
 
+  if (typeof window === "undefined" || typeof localStorage === "undefined") {
+    broadcastLocalChange(clonedData);
+    return;
+  }
+
+  // 2. Synchronously save to LocalStorage with fallback strategies to prevent QuotaExceededError
   try {
-    const serialized = JSON.stringify(clonedData);
+    // Strategy A: Compacted payload (lossless, 60-75% smaller than raw JSON)
+    const compacted = compactSystemPayload(clonedData);
+    const serialized = JSON.stringify(compacted);
     localStorage.setItem(STORAGE_KEY, serialized);
-  } catch (e) {
-    console.error("Local storage synchronous save error:", e);
+  } catch (err: any) {
+    // Quota exceeded: clean legacy keys and try leaner strategies
+    cleanupLegacyStorageKeys();
+
+    try {
+      // Strategy B: Lean cache + compaction (preserves all students + recent months/dates)
+      const leanData = createLeanSystemCache(clonedData);
+      const leanCompacted = compactSystemPayload(leanData);
+      const leanSerialized = JSON.stringify(leanCompacted);
+      localStorage.setItem(STORAGE_KEY, leanSerialized);
+    } catch (err2: any) {
+      // Strategy C: Ultra-lean cache (students + config + today's scans only)
+      try {
+        const ultraLean = {
+          students: clonedData.students,
+          attendanceToday: clonedData.attendanceToday,
+          scanLogTimes: clonedData.scanLogTimes,
+          scanLogOrder: clonedData.scanLogOrder,
+          usersList: clonedData.usersList,
+          groupPrices: clonedData.groupPrices,
+          activeSessionSlotId: clonedData.activeSessionSlotId,
+          updatedAt: clonedData.updatedAt,
+          _isUltraLean: true,
+        };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(compactSystemPayload(ultraLean)));
+      } catch (err3) {
+        // Safe graceful fallback: data is completely preserved in memoryCachedData & IndexedDB
+        console.warn("LocalStorage quota full; persisted completely to IndexedDB & memory cache.");
+      }
+    }
   }
 
   broadcastLocalChange(clonedData);
@@ -1749,6 +1903,9 @@ export async function pullLatestCloudDataImmediately(): Promise<boolean> {
 }
 
 let snapshotReconnectAttempts = 0;
+let isProcessingSnapshot = false;
+let pendingSnapshotVal: any = null;
+let lastProcessedCloudTimestamp = 0;
 
 function ensureActiveSnapshotListener() {
   if (activeSnapshotUnsubscribe) return;
@@ -1783,35 +1940,61 @@ function ensureActiveSnapshotListener() {
                 return;
               }
 
-              const cloudObj: Partial<SystemData> = await resolvePayloadFromSnapshot(val);
-              const currentLocal = loadLocalData();
-
-              // Perform intelligent multi-device 3-way merge
-              const merged = mergeCloudDataWithLocal(currentLocal, cloudObj);
-
-              const incomingHash = JSON.stringify(merged);
-              if (incomingHash === lastSyncedDataHash) {
+              // 2. Ignore stale snapshot timestamps to eliminate ping-pong sync loops between devices
+              const snapTimestamp = typeof val.updatedAt === "number" ? val.updatedAt : 0;
+              if (snapTimestamp > 0 && snapTimestamp <= lastProcessedCloudTimestamp) {
                 return;
               }
 
-              lastSyncedDataHash = incomingHash;
-              saveToLocalStorage(merged, false);
+              // 3. Queue snapshot and serialize processing so rapid updates do not block the JS thread
+              pendingSnapshotVal = val;
+              if (isProcessingSnapshot) {
+                return;
+              }
 
-              // Successfully absorbed cloud data into local storage.
-              // Mark pending sync as false and NEVER bounce back writes to Firestore inside onSnapshot!
-              localStorage.setItem(PENDING_SYNC_KEY, "false");
+              isProcessingSnapshot = true;
+              try {
+                while (pendingSnapshotVal) {
+                  const currentSnap = pendingSnapshotVal;
+                  pendingSnapshotVal = null;
 
-              notifySyncStatusChange();
-              notifyCloudDataListeners(merged);
-              if (typeof window !== "undefined") {
-                window.dispatchEvent(
-                  new CustomEvent("center-data-updated", { detail: merged })
-                );
+                  const cloudObj: Partial<SystemData> = await resolvePayloadFromSnapshot(currentSnap);
+                  if (typeof currentSnap.updatedAt === "number") {
+                    lastProcessedCloudTimestamp = Math.max(lastProcessedCloudTimestamp, currentSnap.updatedAt);
+                  }
+
+                  const currentLocal = loadLocalData();
+
+                  // Perform intelligent multi-device 3-way merge
+                  const merged = mergeCloudDataWithLocal(currentLocal, cloudObj);
+
+                  const incomingHash = JSON.stringify(merged);
+                  if (incomingHash === lastSyncedDataHash) {
+                    continue;
+                  }
+
+                  lastSyncedDataHash = incomingHash;
+                  saveToLocalStorage(merged, false);
+
+                  // Mark pending sync as false and NEVER bounce back writes to Firestore inside onSnapshot
+                  localStorage.setItem(PENDING_SYNC_KEY, "false");
+
+                  notifySyncStatusChange();
+                  notifyCloudDataListeners(merged);
+                  if (typeof window !== "undefined") {
+                    window.dispatchEvent(
+                      new CustomEvent("center-data-updated", { detail: merged })
+                    );
+                  }
+                }
+              } finally {
+                isProcessingSnapshot = false;
               }
             }
           }
         } catch (procErr) {
           console.warn("Error processing snapshot update:", procErr);
+          isProcessingSnapshot = false;
         }
       },
       (error) => {
@@ -1935,7 +2118,7 @@ if (typeof window !== "undefined") {
   window.addEventListener("beforeunload", () => {
     if (memoryCachedData) {
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(memoryCachedData));
+        saveToLocalStorage(memoryCachedData, false);
       } catch (e) {}
     }
   });

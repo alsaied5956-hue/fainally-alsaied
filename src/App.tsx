@@ -34,6 +34,7 @@ import {
   clearAllSystemData,
   autoPushLocalDiskOnStartup,
   pullLatestCloudDataImmediately,
+  hydrateFromIndexedDB,
   SyncStatus,
 } from "./utils/storage";
 import {
@@ -194,6 +195,9 @@ export default function App() {
         setActiveSessionSlotId(data.activeSessionSlotId);
       }
     }
+
+    // Restore full historical snapshot from IndexedDB if localStorage was capped by quota
+    hydrateFromIndexedDB().catch(() => {});
 
     // 1. Immediately pull latest cloud state if device was turned off/offline
     pullLatestCloudDataImmediately().catch(() => {});

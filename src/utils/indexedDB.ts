@@ -145,7 +145,13 @@ export async function loadSnapshotFromIndexedDB(key: string): Promise<any | null
       const req = store.get(key);
 
       req.onsuccess = () => {
-        resolve(req.result ? req.result.data : null);
+        if (!req.result) {
+          resolve(null);
+        } else if (req.result.data !== undefined) {
+          resolve(req.result.data);
+        } else {
+          resolve(req.result);
+        }
       };
       req.onerror = () => {
         resolve(null);
