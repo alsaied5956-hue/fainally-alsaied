@@ -3,17 +3,40 @@
  * 
  * Production-Ready, Zero-Data-Loss, Offline-First Architecture Schemas
  * 
- * Supports:
+ * Hardened Features:
  *  1. Write-Ahead Log (WAL) with durability guarantees
- *  2. Durable Tombstones to prevent "Zombie Data Resurrection"
+ *  2. Durable Tombstones & 90-Day Zombie Data Guard
  *  3. Idempotent Attendance with deterministic deduplication keys
  *  4. Immutable Append-Only Financial Ledger (Strictly NO Last-Write-Wins)
- *  5. Real-Time Parent Read-Only Views & Instant Notification Pipelines
- *  6. Hybrid Logical Clocks (HLC) for monotonic cross-device ordering
+ *  5. Throttled Real-Time Parent Read-Only Views & 2-Hour Notification TTL
+ *  6. Hybrid Logical Clocks (HLC) & Hardware Clock Drift Guard (±5 minutes)
+ *  7. OS Non-Volatile Storage Persistence (`navigator.storage.persist()`)
+ *  8. Time-To-Live (TTL) Deduplication Buffer for Echo Suppression
  */
 
 // --------------------------------------------------------------------------
-// 1. HYBRID LOGICAL CLOCK (HLC) DEFINITION
+// 1. SYSTEM ARCHITECTURE CONSTANTS & THRESHOLDS
+// --------------------------------------------------------------------------
+
+export const ARCHITECTURE_CONSTANTS = {
+  /** Maximum allowable physical clock drift between local device and server (±5 minutes) */
+  CLOCK_DRIFT_MAX_MS: 5 * 60 * 1000,
+  /** Maximum retention period for tombstones before a device is considered zombie-stale (90 days) */
+  TOMBSTONE_MAX_AGE_MS: 90 * 24 * 60 * 60 * 1000,
+  /** Maximum age for queued parent attendance alerts before automatic discard (2 hours) */
+  EXPIRED_NOTIFICATION_TTL_MS: 2 * 60 * 60 * 1000,
+  /** Safe throttling interval when flushing queued notifications on reconnect (500ms per alert) */
+  NOTIFICATION_THROTTLE_INTERVAL_MS: 500,
+  /** Sliding TTL window for suppressing multi-device broadcast echoes (5 minutes) */
+  ECHO_DEDUP_TTL_MS: 5 * 60 * 1000,
+  /** Interval for coalescing background cloud writes (4 seconds) */
+  BATCH_COALESCE_INTERVAL_MS: 4000,
+  /** Maximum records per single batch flush */
+  MAX_BATCH_SIZE: 50,
+} as const;
+
+// --------------------------------------------------------------------------
+// 2. HYBRID LOGICAL CLOCK (HLC) DEFINITION
 // --------------------------------------------------------------------------
 
 export interface HybridLogicalClock {
@@ -53,7 +76,7 @@ export function parseHLC(str: string): HybridLogicalClock {
 }
 
 // --------------------------------------------------------------------------
-// 2. DETERMINISTIC HASH & IDEMPOTENCY KEY GENERATORS
+// 3. DETERMINISTIC HASH & IDEMPOTENCY KEY GENERATORS
 // --------------------------------------------------------------------------
 
 /**
@@ -112,7 +135,7 @@ export function generateIdempotencyKey(
 }
 
 // --------------------------------------------------------------------------
-// 3. WRITE-AHEAD LOG (WAL) SCHEMA
+// 4. WRITE-AHEAD LOG (WAL) SCHEMA
 // --------------------------------------------------------------------------
 
 export type WALEntityType =
@@ -144,7 +167,7 @@ export interface WALRecord<T = any> {
 }
 
 // --------------------------------------------------------------------------
-// 4. TOMBSTONE RECORD SCHEMA (Prevents Zombie Data Resurrection)
+// 5. TOMBSTONE RECORD SCHEMA (Prevents Zombie Data Resurrection)
 // --------------------------------------------------------------------------
 
 export interface TombstoneRecord {
@@ -155,12 +178,12 @@ export interface TombstoneRecord {
   deletedBy: string;
   reason?: string;
   createdAt: number;
-  ttlMs: number; // 90 days = 90 * 86400 * 1000
+  ttlMs: number; // 90 days = ARCHITECTURE_CONSTANTS.TOMBSTONE_MAX_AGE_MS
   purged: boolean;
 }
 
 // --------------------------------------------------------------------------
-// 5. IDEMPOTENT ATTENDANCE SCHEMA
+// 6. IDEMPOTENT ATTENDANCE SCHEMA
 // --------------------------------------------------------------------------
 
 export interface IdempotentAttendanceRecord {
@@ -182,7 +205,7 @@ export interface IdempotentAttendanceRecord {
 }
 
 // --------------------------------------------------------------------------
-// 6. IMMUTABLE FINANCIAL LEDGER SCHEMA (Strictly Append-Only)
+// 7. IMMUTABLE FINANCIAL LEDGER SCHEMA (Strictly Append-Only)
 // --------------------------------------------------------------------------
 
 export type FinancialTransactionType =
@@ -227,7 +250,7 @@ export interface StudentFinancialSummary {
 }
 
 // --------------------------------------------------------------------------
-// 7. PARENT READ-ONLY VIEWS & REAL-TIME NOTIFICATION SCHEMA
+// 8. PARENT READ-ONLY VIEWS & REAL-TIME NOTIFICATION SCHEMA
 // --------------------------------------------------------------------------
 
 export type ParentNotificationType =
@@ -259,8 +282,9 @@ export interface ParentNotificationEvent {
   };
   hlc: HybridLogicalClock;
   timestamp: number;
-  deliveryStatus: "QUEUED" | "SENT_REALTIME" | "OFFLINE_QUEUED" | "DELIVERED";
+  deliveryStatus: "QUEUED" | "SENT_REALTIME" | "OFFLINE_QUEUED" | "DELIVERED" | "EXPIRED_DISCARDED";
   sentAt?: number;
+  discardReason?: string;
 }
 
 export interface ParentPortalStudentView {
@@ -306,12 +330,94 @@ export interface ParentPortalStudentView {
 }
 
 // --------------------------------------------------------------------------
-// 8. INDEXEDDB STORE CONFIGURATION
+// 9. BROWSER STORAGE PERSISTENCE (EVICTION & DATA LOSS PREVENTION)
+// --------------------------------------------------------------------------
+
+export interface StoragePersistenceStatus {
+  supported: boolean;
+  persisted: boolean;
+  quotaBytes?: number;
+  usageBytes?: number;
+  usagePercentage?: number;
+  error?: string;
+}
+
+/**
+ * Enforces navigator.storage.persist() on app boot to request non-volatile storage
+ * from the operating system (e.g. preventing iOS Safari or Chrome low-disk eviction).
+ */
+export async function requestStoragePersistence(): Promise<boolean> {
+  if (typeof window === "undefined" || !navigator.storage || !navigator.storage.persist) {
+    console.warn("[StoragePersistence] navigator.storage.persist is not supported in this environment.");
+    return false;
+  }
+
+  try {
+    const isAlreadyPersisted = await navigator.storage.persisted();
+    if (isAlreadyPersisted) {
+      console.log("[StoragePersistence] Storage is already non-volatile (persisted: true).");
+      return true;
+    }
+
+    const granted = await navigator.storage.persist();
+    if (granted) {
+      console.log("[StoragePersistence] Non-volatile storage successfully granted by browser/OS.");
+    } else {
+      console.warn("[StoragePersistence] Persistent storage request was denied by browser/OS (storage may be subject to eviction).");
+    }
+    return granted;
+  } catch (err: any) {
+    console.warn("[StoragePersistence] Error requesting storage persistence:", err?.message || err);
+    return false;
+  }
+}
+
+/**
+ * Queries current storage persistence state and quota metrics.
+ */
+export async function checkStoragePersistence(): Promise<StoragePersistenceStatus> {
+  if (typeof window === "undefined" || !navigator.storage) {
+    return { supported: false, persisted: false };
+  }
+
+  try {
+    const persisted = navigator.storage.persisted ? await navigator.storage.persisted() : false;
+    let quotaBytes: number | undefined;
+    let usageBytes: number | undefined;
+    let usagePercentage: number | undefined;
+
+    if (navigator.storage.estimate) {
+      const estimate = await navigator.storage.estimate();
+      quotaBytes = estimate.quota;
+      usageBytes = estimate.usage;
+      if (quotaBytes && usageBytes !== undefined) {
+        usagePercentage = Math.round((usageBytes / quotaBytes) * 10000) / 100;
+      }
+    }
+
+    return {
+      supported: true,
+      persisted,
+      quotaBytes,
+      usageBytes,
+      usagePercentage,
+    };
+  } catch (err: any) {
+    return {
+      supported: true,
+      persisted: false,
+      error: err?.message || String(err),
+    };
+  }
+}
+
+// --------------------------------------------------------------------------
+// 10. INDEXEDDB STORE CONFIGURATION
 // --------------------------------------------------------------------------
 
 export const ARCHITECTURE_DB_CONFIG = {
-  name: "AimanUnifiedOfflineDB_v2",
-  version: 2,
+  name: "AimanUnifiedOfflineDB_v3",
+  version: 3,
   stores: {
     WAL: "write_ahead_log",
     TOMBSTONES: "tombstones",
@@ -319,6 +425,7 @@ export const ARCHITECTURE_DB_CONFIG = {
     FINANCIAL_LEDGER: "financial_ledger",
     PARENT_NOTIFICATION_QUEUE: "parent_notification_queue",
     IDEMPOTENCY_KEYS: "idempotency_keys_cache",
+    EMERGENCY_BACKUPS: "emergency_backups",
     CLIENT_STATE: "client_state",
   },
 } as const;

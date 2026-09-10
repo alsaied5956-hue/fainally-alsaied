@@ -3,13 +3,14 @@
  * 
  * Sub-Second Event Broadcast Pipeline for Parents Tracking Portal
  * 
- * Capabilities:
- *  - Sub-second instant push via Supabase Realtime WebSockets & Firebase live streams
- *  - Browser BroadcastChannel for instant local inter-tab communication (<1ms)
- *  - Offline Queuing & Fallback: Stores undelivered parent events in durable queue
- *  - Rapid Reconnection Flusher: Drains queued notifications upon network reconnection
- *  - Sliding-Window Deduplication: Suppresses duplicate alerts across parallel transports
- *  - Mock / Edge FCM Webhook trigger for background push alerts
+ * Hardened Features:
+ *  1. Throttled Offline Notification Flushing (1 notification per 500ms on reconnect)
+ *  2. 2-Hour Notification TTL: Automatically discards alerts older than 2 hours
+ *     to prevent midnight spam bursts while strictly preserving database sync.
+ *  3. Parent Portal Battery & Data Saver: Pauses persistent WebSockets in background;
+ *     switches to lightweight push notifications / resumes only in foreground.
+ *  4. Time-To-Live (TTL) Deduplication Buffer for Echo Suppression
+ *  5. Browser BroadcastChannel for instant local inter-tab communication (<1ms)
  */
 
 import {
@@ -17,35 +18,17 @@ import {
   ParentNotificationType,
   HybridLogicalClock,
   deterministicHash,
+  ARCHITECTURE_CONSTANTS,
 } from "./dbSchema";
 import { supabase } from "../utils/supabaseClient";
 import { pushLiveAttendanceEvent } from "../utils/liveEventStream";
+import { shouldSuppressEcho, CURRENT_CLIENT_ID } from "./syncEngine";
 
 // --------------------------------------------------------------------------
-// 1. SLIDING WINDOW DEDUPLICATION CACHE
+// 1. OFFLINE NOTIFICATION QUEUE (PERSISTED LOCALSTORAGE & MEMORY)
 // --------------------------------------------------------------------------
 
-const DEDUP_CACHE_LIMIT = 1000;
-const processedEventIds = new Set<string>();
-const recentEventTimestampMap = new Map<string, number>();
-
-function isDuplicateEvent(eventId: string): boolean {
-  if (processedEventIds.has(eventId)) {
-    return true;
-  }
-  processedEventIds.add(eventId);
-  if (processedEventIds.size > DEDUP_CACHE_LIMIT) {
-    const first = processedEventIds.values().next().value;
-    if (first) processedEventIds.delete(first);
-  }
-  return false;
-}
-
-// --------------------------------------------------------------------------
-// 2. OFFLINE NOTIFICATION QUEUE (IN-MEMORY + LOCALSTORAGE/INDEXEDDB)
-// --------------------------------------------------------------------------
-
-const OFFLINE_QUEUE_KEY = "aiman_parent_offline_notifications_v2";
+const OFFLINE_QUEUE_KEY = "aiman_parent_offline_notifications_v3";
 let offlineQueue: ParentNotificationEvent[] = [];
 
 function loadOfflineQueue(): ParentNotificationEvent[] {
@@ -61,7 +44,7 @@ function loadOfflineQueue(): ParentNotificationEvent[] {
 function persistOfflineQueue(queue: ParentNotificationEvent[]): void {
   if (typeof window === "undefined") return;
   try {
-    // Keep max 500 recent queued events to avoid quota overflow
+    // Keep max 500 recent queued events to avoid localStorage overflow
     const trimmed = queue.slice(-500);
     localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(trimmed));
   } catch (err) {
@@ -69,18 +52,17 @@ function persistOfflineQueue(queue: ParentNotificationEvent[]): void {
   }
 }
 
-// Initialize queue
 if (typeof window !== "undefined") {
   offlineQueue = loadOfflineQueue();
 }
 
 // --------------------------------------------------------------------------
-// 3. BROADCAST CHANNEL & REALTIME SUBSCRIPTION HUB
+// 2. BROADCAST CHANNEL & REALTIME SUBSCRIPTION HUB
 // --------------------------------------------------------------------------
 
 const localParentChannel =
   typeof window !== "undefined" && "BroadcastChannel" in window
-    ? new BroadcastChannel("aiman_parent_realtime_stream")
+    ? new BroadcastChannel("aiman_parent_realtime_stream_v3")
     : null;
 
 type ParentEventListener = (event: ParentNotificationEvent) => void;
@@ -90,7 +72,7 @@ if (localParentChannel) {
   localParentChannel.onmessage = (e) => {
     if (e.data && e.data.eventId) {
       const event = e.data as ParentNotificationEvent;
-      if (!isDuplicateEvent(event.eventId)) {
+      if (!shouldSuppressEcho(event.eventId)) {
         parentListeners.forEach((fn) => {
           try {
             fn(event);
@@ -104,7 +86,7 @@ if (localParentChannel) {
 }
 
 // --------------------------------------------------------------------------
-// 4. CORE BROADCAST PIPELINE: SUB-SECOND DISPATCH
+// 3. CORE BROADCAST PIPELINE: SUB-SECOND DISPATCH
 // --------------------------------------------------------------------------
 
 export interface EmitParentEventParams {
@@ -121,10 +103,7 @@ export interface EmitParentEventParams {
 
 /**
  * Dispatches an attendance or payment event to the parent portal in < 50ms.
- * Uses a triple-transport pipeline:
- *  1. Local BroadcastChannel (<1ms across local browser windows/tabs)
- *  2. Supabase Realtime WebSocket broadcast (<20ms cloud delivery)
- *  3. Firebase live_events/today stream (<300ms fallback)
+ * Checks for echo suppression, queues for offline delivery, and respects battery saver.
  */
 export async function emitParentNotification(params: EmitParentEventParams): Promise<ParentNotificationEvent> {
   const ts = params.timestamp || Date.now();
@@ -137,6 +116,8 @@ export async function emitParentNotification(params: EmitParentEventParams): Pro
     ts
   ).slice(0, 16)}`;
 
+  const isOnline = typeof window !== "undefined" ? navigator.onLine : true;
+
   const event: ParentNotificationEvent = {
     eventId,
     studentBarcode: String(params.studentBarcode).trim(),
@@ -148,12 +129,12 @@ export async function emitParentNotification(params: EmitParentEventParams): Pro
     meta: params.meta,
     hlc: params.hlc,
     timestamp: ts,
-    deliveryStatus: "SENT_REALTIME",
-    sentAt: Date.now(),
+    deliveryStatus: isOnline ? "SENT_REALTIME" : "OFFLINE_QUEUED",
+    sentAt: isOnline ? Date.now() : undefined,
   };
 
-  // Prevent local duplicates
-  if (isDuplicateEvent(eventId)) {
+  // Prevent duplicate echoes using 5-minute sliding TTL
+  if (shouldSuppressEcho(eventId, CURRENT_CLIENT_ID)) {
     return event;
   }
 
@@ -169,9 +150,15 @@ export async function emitParentNotification(params: EmitParentEventParams): Pro
     } catch {}
   });
 
-  // 2️⃣ Queue in durable local store for offline resilience
+  // 2️⃣ Queue in durable local store
   offlineQueue.push(event);
   persistOfflineQueue(offlineQueue);
+
+  // If offline, leave in queue to be throttled when back online
+  if (!isOnline) {
+    console.log(`[ParentSyncNotifier] Queued parent event ${eventId} for offline throttled flush.`);
+    return event;
+  }
 
   // 3️⃣ Supabase Realtime Broadcast (<20ms cloud delivery)
   try {
@@ -184,7 +171,6 @@ export async function emitParentNotification(params: EmitParentEventParams): Pro
       payload: event,
     }).catch(() => {});
 
-    // Also broadcast on global feed for parents app
     channel.send({
       type: "broadcast",
       event: "parent_stream_feed",
@@ -213,13 +199,11 @@ export async function emitParentNotification(params: EmitParentEventParams): Pro
 }
 
 /**
- * Trigger edge webhook for background FCM notification delivery
- * Designed not to block the UI thread or scanner responsiveness.
+ * Trigger edge webhook for background FCM notification delivery.
  */
 async function triggerParentWebhookAsync(event: ParentNotificationEvent): Promise<void> {
   if (typeof window === "undefined" || !navigator.onLine) return;
   try {
-    // Non-blocking fetch to server webhook endpoint if available
     fetch("/api/notifications/parent-push", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -232,19 +216,149 @@ async function triggerParentWebhookAsync(event: ParentNotificationEvent): Promis
         type: event.type,
         timestamp: event.timestamp,
       }),
-    }).catch(() => {
-      // Endpoint may be mocked or offline; fail silently without affecting scanner
-    });
+    }).catch(() => {});
   } catch {}
 }
 
 // --------------------------------------------------------------------------
-// 5. PARENT SUBSCRIPTION & RECONNECTION RECONCILIATION
+// 4. THROTTLED OFFLINE NOTIFICATION FLUSHER & 2-HOUR TTL QUEUE
 // --------------------------------------------------------------------------
+
+let isThrottlingFlush = false;
+let throttleTimer: ReturnType<typeof setTimeout> | null = null;
+
+export interface FlushSummary {
+  processedCount: number;
+  deliveredCount: number;
+  discardedExpiredCount: number;
+}
+
+/**
+ * Flushes queued offline notifications safely when network recovers.
+ *  - Rate: 1 notification every 500ms (prevents push spam burst)
+ *  - TTL: Discards alerts older than 2 hours to avoid middle-of-the-night alerts
+ */
+export async function flushThrottledOfflineNotifications(): Promise<FlushSummary> {
+  if (isThrottlingFlush) {
+    return { processedCount: 0, deliveredCount: 0, discardedExpiredCount: 0 };
+  }
+  if (typeof window !== "undefined" && !navigator.onLine) {
+    return { processedCount: 0, deliveredCount: 0, discardedExpiredCount: 0 };
+  }
+
+  isThrottlingFlush = true;
+  let deliveredCount = 0;
+  let discardedExpiredCount = 0;
+
+  try {
+    const now = Date.now();
+    const pending = offlineQueue.filter((ev) => ev.deliveryStatus === "OFFLINE_QUEUED" || !ev.sentAt);
+
+    for (const event of pending) {
+      if (typeof window !== "undefined" && !navigator.onLine) {
+        break; // Network dropped again, pause flushing
+      }
+
+      // Check 2-Hour TTL Expiration
+      const ageMs = now - event.timestamp;
+      if (ageMs > ARCHITECTURE_CONSTANTS.EXPIRED_NOTIFICATION_TTL_MS) {
+        event.deliveryStatus = "EXPIRED_DISCARDED";
+        event.discardReason = `Expired: Alert is ${Math.round(ageMs / 60000)} minutes old (> 2 hours). Discarded to prevent notification spam burst.`;
+        discardedExpiredCount++;
+        console.log(`[ParentSyncNotifier TTL] ${event.discardReason} (Student: ${event.studentName})`);
+        continue;
+      }
+
+      // Deliver alert with throttled pause
+      try {
+        await triggerParentWebhookAsync(event);
+        event.deliveryStatus = "DELIVERED";
+        event.sentAt = Date.now();
+        deliveredCount++;
+      } catch (err) {
+        console.warn("[ParentSyncNotifier] Webhook trigger error during throttled flush:", err);
+      }
+
+      // Sleep for 500ms to throttle burst
+      await new Promise((resolve) => setTimeout(resolve, ARCHITECTURE_CONSTANTS.NOTIFICATION_THROTTLE_INTERVAL_MS));
+    }
+
+    persistOfflineQueue(offlineQueue);
+  } finally {
+    isThrottlingFlush = false;
+  }
+
+  return {
+    processedCount: deliveredCount + discardedExpiredCount,
+    deliveredCount,
+    discardedExpiredCount,
+  };
+}
+
+// Auto-trigger throttled flush on network recovery
+if (typeof window !== "undefined") {
+  window.addEventListener("online", () => {
+    console.log("[ParentSyncNotifier] Network reconnected. Starting throttled notification flush (1 every 500ms with 2h TTL)...");
+    flushThrottledOfflineNotifications().catch(() => {});
+  });
+}
+
+// --------------------------------------------------------------------------
+// 5. PARENT PORTAL BATTERY & DATA SAVER ARCHITECTURE
+// --------------------------------------------------------------------------
+
+class ParentPortalBatteryManager {
+  private activeChannels = new Map<string, any>();
+  private isForeground = true;
+
+  constructor() {
+    if (typeof window !== "undefined" && typeof document !== "undefined") {
+      this.isForeground = document.visibilityState === "visible";
+      document.addEventListener("visibilitychange", () => {
+        const wasForeground = this.isForeground;
+        this.isForeground = document.visibilityState === "visible";
+
+        if (wasForeground && !this.isForeground) {
+          this.handleAppBackground();
+        } else if (!wasForeground && this.isForeground) {
+          this.handleAppForeground();
+        }
+      });
+    }
+  }
+
+  public registerChannel(key: string, channel: any) {
+    this.activeChannels.set(key, channel);
+  }
+
+  public unregisterChannel(key: string) {
+    this.activeChannels.delete(key);
+  }
+
+  private handleAppBackground() {
+    console.log("[ParentBatterySaver] App went to background. Pausing active WebSockets to preserve mobile battery & data.");
+    for (const [key, channel] of this.activeChannels.entries()) {
+      try {
+        supabase.removeChannel(channel);
+      } catch {}
+    }
+  }
+
+  private handleAppForeground() {
+    console.log("[ParentBatterySaver] App restored to foreground. Resuming live channels & running catch-up sync.");
+    // Subscribers will auto-reconnect via their visibility listeners or re-subscribe callbacks
+  }
+
+  public getIsForeground(): boolean {
+    return this.isForeground;
+  }
+}
+
+export const parentBatteryManager = new ParentPortalBatteryManager();
 
 /**
  * Subscribes a Parent Portal view to live events for a specific student barcode.
- * Includes automatic missed event replay on reconnection.
+ * Includes automatic missed event replay and Battery/Data Saver foreground-only WebSocket management.
  */
 export function subscribeToParentStudentStream(
   studentBarcode: string,
@@ -253,10 +367,10 @@ export function subscribeToParentStudentStream(
 ): () => void {
   const cleanBarcode = String(studentBarcode).trim();
 
-  // 1. Check local offline queue for events that happened since lastKnownTimestamp
+  // 1. Replay missed offline events since lastKnownTimestamp
   if (lastKnownTimestamp > 0 && offlineQueue.length > 0) {
     const missed = offlineQueue.filter(
-      (ev) => ev.studentBarcode === cleanBarcode && ev.timestamp > lastKnownTimestamp
+      (ev) => ev.studentBarcode === cleanBarcode && ev.timestamp > lastKnownTimestamp && ev.deliveryStatus !== "EXPIRED_DISCARDED"
     );
     missed.forEach((ev) => {
       try {
@@ -273,63 +387,62 @@ export function subscribeToParentStudentStream(
   };
   parentListeners.add(listener);
 
-  // 3. Register Supabase Realtime listener
+  // 3. Register Supabase Realtime listener with Battery Saver
   let channel: any = null;
-  try {
-    channel = supabase
-      .channel(`parent-student-${cleanBarcode}`)
-      .on(
-        "broadcast",
-        { event: `parent_event_${cleanBarcode}` },
-        ({ payload }) => {
-          if (payload && !isDuplicateEvent(payload.eventId)) {
-            onEvent(payload as ParentNotificationEvent);
+
+  const connectRealtime = () => {
+    try {
+      if (channel) supabase.removeChannel(channel);
+      channel = supabase
+        .channel(`parent-student-${cleanBarcode}`)
+        .on(
+          "broadcast",
+          { event: `parent_event_${cleanBarcode}` },
+          ({ payload }) => {
+            if (payload && !shouldSuppressEcho(payload.eventId)) {
+              onEvent(payload as ParentNotificationEvent);
+            }
           }
-        }
-      )
-      .subscribe((status) => {
-        console.log(`[ParentSyncNotifier] Stream for ${cleanBarcode}: ${status}`);
-      });
-  } catch (err) {
-    console.warn("[ParentSyncNotifier] Subscription failed:", err);
+        )
+        .subscribe((status) => {
+          console.log(`[ParentSyncNotifier] Stream for ${cleanBarcode}: ${status}`);
+        });
+
+      parentBatteryManager.registerChannel(`parent_${cleanBarcode}`, channel);
+    } catch (err) {
+      console.warn("[ParentSyncNotifier] Subscription notice:", err);
+    }
+  };
+
+  if (parentBatteryManager.getIsForeground()) {
+    connectRealtime();
+  }
+
+  // Listen to visibility changes for battery saving
+  const handleVisibility = () => {
+    if (document.visibilityState === "visible") {
+      connectRealtime();
+    } else {
+      if (channel) {
+        supabase.removeChannel(channel);
+        parentBatteryManager.unregisterChannel(`parent_${cleanBarcode}`);
+        channel = null;
+      }
+    }
+  };
+
+  if (typeof window !== "undefined" && typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", handleVisibility);
   }
 
   return () => {
     parentListeners.delete(listener);
     if (channel) {
       supabase.removeChannel(channel);
+      parentBatteryManager.unregisterChannel(`parent_${cleanBarcode}`);
+    }
+    if (typeof window !== "undefined" && typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", handleVisibility);
     }
   };
-}
-
-/**
- * Flush and drain offline queue when parent/admin device reconnects to network.
- */
-export async function flushOfflineParentNotifications(): Promise<number> {
-  if (offlineQueue.length === 0 || !navigator.onLine) return 0;
-
-  const pending = offlineQueue.filter((ev) => ev.deliveryStatus === "OFFLINE_QUEUED" || !ev.sentAt);
-  if (pending.length === 0) return 0;
-
-  let deliveredCount = 0;
-  for (const event of pending) {
-    try {
-      await triggerParentWebhookAsync(event);
-      event.deliveryStatus = "DELIVERED";
-      event.sentAt = Date.now();
-      deliveredCount++;
-    } catch {
-      break;
-    }
-  }
-
-  persistOfflineQueue(offlineQueue);
-  return deliveredCount;
-}
-
-// Auto-flush on window online event
-if (typeof window !== "undefined") {
-  window.addEventListener("online", () => {
-    flushOfflineParentNotifications().catch(() => {});
-  });
 }

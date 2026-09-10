@@ -221,6 +221,15 @@ async function startServer() {
     });
   });
 
+  // Fast Server Time Endpoint for Clock Drift Guard (±5 min threshold)
+  app.get("/api/time", (_req: Request, res: Response) => {
+    res.json({
+      ok: true,
+      serverTime: Date.now(),
+      iso: new Date().toISOString(),
+    });
+  });
+
   // -------------------------------------------------------------
   // SYSTEM 1: Unified Center Synchronization Hub (الموقع الموحد)
   // -------------------------------------------------------------

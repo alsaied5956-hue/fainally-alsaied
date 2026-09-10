@@ -4,12 +4,13 @@
  * Sub-20ms Feedback Scanner Handler for Barcode / NFC Student Cards
  * 
  * Flow:
- *  1. Sub-1ms Deterministic Idempotency Key Evaluation (Prevents duplicate scans across offline devices)
- *  2. Immediate <1ms Local Write-Ahead Log (WAL) Commit
- *  3. Instant UI feedback payload & Audio beep trigger (<5ms)
- *  4. Instant Sub-Second Real-Time Parent Notification Dispatch (<20ms)
- *  5. Background Enqueue into Safe 4-Second Coalescing Batch Writer (Rate-limit immune)
- *  6. Cross-Device Broadcast with CLIENT_ID Echo Suppression
+ *  1. Clock Drift Pre-flight Guard Check (warns/blocks if physical clock drift > ±5 mins)
+ *  2. Sub-1ms Deterministic Idempotency Key Evaluation (Prevents duplicate scans across offline devices)
+ *  3. Immediate <1ms Local Write-Ahead Log (WAL) Commit
+ *  4. Instant UI feedback payload & Audio beep trigger (<5ms)
+ *  5. Instant Sub-Second Real-Time Parent Notification Dispatch (<20ms) with 2-Hour TTL
+ *  6. Background Enqueue into Safe 4-Second Coalescing Batch Writer (Rate-limit immune)
+ *  7. Cross-Device Broadcast with CLIENT_ID Time-Based Echo Suppression
  */
 
 import { Student } from "../types";
@@ -26,13 +27,14 @@ import {
   markIdempotencyKeySeen,
   HLCEngine,
   CURRENT_CLIENT_ID,
+  getClockDriftStatus,
 } from "./syncEngine";
 import { emitParentNotification } from "./parentSyncNotifier";
 import { broadcastLiveScan } from "../utils/supabaseClient";
 
 export interface ScanProcessingResult {
   success: boolean;
-  status: "حضور" | "تأخير" | "duplicate" | "rejected_grade" | "student_not_found";
+  status: "حضور" | "تأخير" | "duplicate" | "rejected_grade" | "student_not_found" | "clock_drift_error";
   attendanceRecord?: IdempotentAttendanceRecord;
   student?: Student;
   message: string;
@@ -70,7 +72,22 @@ export async function processStudentScan(input: ProcessScanInput): Promise<ScanP
   const day = String(now.getDate()).padStart(2, "0");
   const dateKey = `${year}-${month}-${day}`;
 
-  // 1. Locate student in memory (< 1ms)
+  // 1. Hardware Clock Drift Pre-flight Guard Check
+  const driftStatus = getClockDriftStatus();
+  if (driftStatus.hasDriftError) {
+    playBeep("error");
+    return {
+      success: false,
+      status: "clock_drift_error",
+      message: driftStatus.errorMessage || "⚠️ تم إيقاف المسح مؤقتاً: فارق توقيت الجهاز عن السيرفر يتجاوز 5 دقائق. يرجى ضبط ساعة الجهاز.",
+      isDuplicate: false,
+      timeDisplay,
+      timeIso,
+      hlcString: "",
+    };
+  }
+
+  // 2. Locate student in memory (< 1ms)
   const student = input.studentsList.find(
     (s) => String(s.barcode).trim() === rawBarcode
   );
@@ -88,7 +105,7 @@ export async function processStudentScan(input: ProcessScanInput): Promise<ScanP
     };
   }
 
-  // 2. Validate student grade
+  // 3. Validate student grade
   if (!input.allowCrossGrade && student.groupGrade !== input.currentGrade) {
     playBeep("error");
     return {
@@ -103,7 +120,7 @@ export async function processStudentScan(input: ProcessScanInput): Promise<ScanP
     };
   }
 
-  // 3. Deterministic Idempotency Key Evaluation (< 1ms)
+  // 4. Deterministic Idempotency Key Evaluation (< 1ms)
   const attendanceKey = generateAttendanceKey(rawBarcode, dateKey, input.activeSessionSlotId || "auto");
 
   const alreadyScannedInMemory = sessionScannedKeys.has(attendanceKey);
@@ -127,15 +144,30 @@ export async function processStudentScan(input: ProcessScanInput): Promise<ScanP
   sessionScannedKeys.add(attendanceKey);
   await markIdempotencyKeySeen(attendanceKey);
 
-  // 4. Calculate attendance status (حضور vs تأخير)
+  // 5. Calculate attendance status (حضور vs تأخير)
   const calculatedStatus: "حضور" | "تأخير" =
     input.overrideStatus || (evaluateAttendanceStatus(now, input.activeSessionSlotId) as "حضور" | "تأخير");
 
-  // 5. Generate Monotonic HLC timestamp
-  const hlc = HLCEngine.now();
+  // 6. Generate Monotonic HLC timestamp
+  let hlc;
+  try {
+    hlc = HLCEngine.now();
+  } catch (err: any) {
+    playBeep("error");
+    return {
+      success: false,
+      status: "clock_drift_error",
+      message: err?.message || "خطأ في ساعة النظام",
+      isDuplicate: false,
+      timeDisplay,
+      timeIso,
+      hlcString: "",
+    };
+  }
+
   const hlcString = `${hlc.logicalTime}:${hlc.counter}:${hlc.nodeId}`;
 
-  // 6. Build Idempotent Attendance Record
+  // 7. Build Idempotent Attendance Record
   const attendanceRecord: IdempotentAttendanceRecord = {
     attendanceKey,
     studentBarcode: rawBarcode,
@@ -154,7 +186,7 @@ export async function processStudentScan(input: ProcessScanInput): Promise<ScanP
     syncedToCloud: false,
   };
 
-  // 7. Write to Local Write-Ahead Log (WAL) (< 1ms)
+  // 8. Write to Local Write-Ahead Log (WAL) (< 1ms)
   await appendWALRecord({
     idempotencyKey: attendanceKey,
     entityType: "ATTENDANCE",
@@ -164,10 +196,10 @@ export async function processStudentScan(input: ProcessScanInput): Promise<ScanP
     status: "PENDING",
   });
 
-  // 8. Instant Audio Feedback (< 5ms)
+  // 9. Instant Audio Feedback (< 5ms)
   playBeep(calculatedStatus === "تأخير" ? "warning" : "success");
 
-  // 9. Instant Sub-Second Real-Time Parent Notification (< 20ms)
+  // 10. Instant Sub-Second Real-Time Parent Notification (< 20ms)
   emitParentNotification({
     studentBarcode: rawBarcode,
     studentName: student.name,
@@ -191,7 +223,7 @@ export async function processStudentScan(input: ProcessScanInput): Promise<ScanP
     console.warn("[ScannerHandler] Parent notification notice:", err);
   });
 
-  // 10. Cross-Device Broadcast with CLIENT_ID Echo Tag (< 20ms)
+  // 11. Cross-Device Broadcast with CLIENT_ID Echo Tag (< 20ms)
   broadcastLiveScan({
     barcode: rawBarcode,
     name: student.name,

@@ -11,6 +11,7 @@
  *  4. DETERMINISTIC TRANSACTION IDS: Prevents duplicate payments during retries or concurrent device sync.
  *  5. REAL-TIME PARENT PAYMENT RECEIPTS: Emits instant digital payment receipt to parent portal.
  *  6. DETERMINISTIC AUDIT CHAIN: Computes exact student fee balances without race conditions.
+ *  7. CLOCK DRIFT GUARD: Validates physical clock stability before financial journal commits.
  */
 
 import {
@@ -27,6 +28,7 @@ import {
   CURRENT_CLIENT_ID,
   isIdempotencyKeySeen,
   markIdempotencyKeySeen,
+  getClockDriftStatus,
 } from "./syncEngine";
 import { emitParentNotification } from "./parentSyncNotifier";
 import { broadcastPaymentChange, savePaymentToSupabase, deletePaymentFromSupabase } from "../utils/supabaseClient";
@@ -40,7 +42,7 @@ const memoryLedger = new Map<string, FinancialLedgerEntry[]>();
 let localSequence = 0;
 
 // Load persisted ledger from localStorage on startup
-const LEDGER_STORAGE_KEY = "aiman_immutable_financial_ledger_v2";
+const LEDGER_STORAGE_KEY = "aiman_immutable_financial_ledger_v3";
 
 function loadPersistedLedger(): void {
   if (typeof window === "undefined") return;
@@ -93,9 +95,14 @@ export interface RecordPaymentInput {
 
 /**
  * Appends a new payment transaction to the immutable ledger.
- * NEVER overwrites existing records.
+ * NEVER overwrites or mutates existing records.
  */
 export async function recordLedgerPayment(input: RecordPaymentInput): Promise<FinancialLedgerEntry> {
+  const drift = getClockDriftStatus();
+  if (drift.hasDriftError) {
+    throw new Error(drift.errorMessage || "⚠️ تم إيقاف المعاملات المالية: فارق توقيت الجهاز يتجاوز 5 دقائق.");
+  }
+
   localSequence++;
   const rawBarcode = String(input.studentBarcode).trim();
   const ts = input.timestamp || Date.now();
@@ -207,6 +214,11 @@ export interface ReversePaymentInput {
  * NEVER deletes or mutates the original transaction record.
  */
 export async function reverseLedgerPayment(input: ReversePaymentInput): Promise<FinancialLedgerEntry> {
+  const drift = getClockDriftStatus();
+  if (drift.hasDriftError) {
+    throw new Error(drift.errorMessage || "⚠️ تم إيقاف المعاملات المالية: فارق توقيت الجهاز يتجاوز 5 دقائق.");
+  }
+
   localSequence++;
   const rawBarcode = String(input.studentBarcode).trim();
   const studentEntries = memoryLedger.get(rawBarcode) || [];

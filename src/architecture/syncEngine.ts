@@ -1,14 +1,15 @@
 /**
  * src/architecture/syncEngine.ts
  * 
- * Production-Grade Admin Sync Manager with:
- *  1. Hybrid Logical Clocks (HLC) for clock-skew-immune monotonic ordering
- *  2. Durable Write-Ahead Log (WAL) with <1ms local persistence
- *  3. Strict Tombstone validation preventing Zombie Data Resurrection
- *  4. Deterministic Idempotency Key validation
- *  5. Echo Suppression using CLIENT_ID & sliding-window deduplication
- *  6. Safe 4-second Coalescing Batch Writer with HTTP 429 rate-limit backoff
- *  7. Append-Only Financial Routing (strictly NO Last-Write-Wins on money)
+ * Production-Grade Master Sync Engine with:
+ *  1. Hybrid Logical Clocks (HLC) with Monotonic cross-device ordering
+ *  2. Server Clock Drift Guard (±5 minutes threshold) preventing HLC corruption
+ *  3. 90-Day Long-Offline Zombie Data Guard (Blocks bidirectional sync; forces Pull-First)
+ *  4. Time-To-Live (TTL) Deduplication Buffer for Echo Suppression (5-minute sliding TTL)
+ *  5. OS Non-Volatile Storage Persistence (`navigator.storage.persist()`)
+ *  6. Durable Write-Ahead Log (WAL) with <1ms local persistence
+ *  7. Safe 4-Second Coalescing Batch Writer with HTTP 429 rate-limit backoff
+ *  8. Strict Tombstone validation preventing Zombie Data Resurrection
  */
 
 import {
@@ -21,17 +22,20 @@ import {
   WALAction,
   TombstoneRecord,
   ARCHITECTURE_DB_CONFIG,
+  ARCHITECTURE_CONSTANTS,
   deterministicHash,
+  requestStoragePersistence,
 } from "./dbSchema";
 import { db, ensureFirebaseAuth } from "../utils/firebase";
-import { doc, writeBatch, setDoc, deleteDoc } from "firebase/firestore";
-import { supabase } from "../utils/supabaseClient";
+import { doc, writeBatch } from "firebase/firestore";
+import { exportUnsyncedWALToJson } from "./emergencyBackup";
 
 // --------------------------------------------------------------------------
-// 1. PERSISTENT CLIENT ID & ECHO SUPPRESSION
+// 1. PERSISTENT CLIENT ID & TIME-BASED TTL ECHO SUPPRESSION
 // --------------------------------------------------------------------------
 
-const CLIENT_ID_STORAGE_KEY = "aiman_device_client_id_v2";
+const CLIENT_ID_STORAGE_KEY = "aiman_device_client_id_v3";
+const LAST_SYNC_TS_KEY = "aiman_last_successful_sync_v3";
 
 export function getOrCreateClientId(): string {
   if (typeof window === "undefined") return "node_server";
@@ -51,27 +55,152 @@ export function getOrCreateClientId(): string {
 
 export const CURRENT_CLIENT_ID = getOrCreateClientId();
 
-// Sliding-window deduplication buffer to suppress echoes
-const ECHO_DEDUP_SIZE = 1000;
-const processedMessageIds = new Set<string>();
+/**
+ * Time-To-Live (TTL) Deduplication Buffer for Echo Suppression
+ * Map<eventId, expireAtEpochMs>
+ * Replaces fixed-size 500/1000 item buffers to prevent high-volume center memory overflow
+ * while guaranteeing suppression for 5 continuous minutes per event.
+ */
+const echoTtlBuffer = new Map<string, number>();
 
-export function shouldSuppressEcho(messageId: string, originClientId?: string): boolean {
+/**
+ * Periodically purges expired entries from the TTL echo buffer (runs every 60s).
+ */
+function purgeExpiredEchoes(): void {
+  const now = Date.now();
+  for (const [id, expireAt] of echoTtlBuffer.entries()) {
+    if (now >= expireAt) {
+      echoTtlBuffer.delete(id);
+    }
+  }
+}
+
+if (typeof window !== "undefined") {
+  setInterval(purgeExpiredEchoes, 60000);
+}
+
+/**
+ * Evaluates whether an incoming event is an echo or duplicate using sliding 5-minute TTL.
+ */
+export function shouldSuppressEcho(eventId: string, originClientId?: string): boolean {
+  if (!eventId) return false;
+
+  // 1. Suppress if originated by this client
   if (originClientId && originClientId === CURRENT_CLIENT_ID) {
-    return true; // Self-originated broadcast echo suppressed
+    return true;
   }
-  if (processedMessageIds.has(messageId)) {
-    return true; // Already processed by this client
+
+  const now = Date.now();
+  const existingExpireAt = echoTtlBuffer.get(eventId);
+
+  // 2. Suppress if seen within active TTL window
+  if (existingExpireAt && now < existingExpireAt) {
+    return true;
   }
-  processedMessageIds.add(messageId);
-  if (processedMessageIds.size > ECHO_DEDUP_SIZE) {
-    const oldest = processedMessageIds.values().next().value;
-    if (oldest) processedMessageIds.delete(oldest);
-  }
+
+  // 3. Register in buffer with sliding 5-minute TTL
+  echoTtlBuffer.set(eventId, now + ARCHITECTURE_CONSTANTS.ECHO_DEDUP_TTL_MS);
   return false;
 }
 
 // --------------------------------------------------------------------------
-// 2. HYBRID LOGICAL CLOCK (HLC) IMPLEMENTATION
+// 2. HARDWARE CLOCK DRIFT & CLOCK TAMPERING GUARD
+// --------------------------------------------------------------------------
+
+interface ClockDriftState {
+  hasDriftError: boolean;
+  driftMs: number;
+  lastCheckedAt: number;
+  serverTimeEstimated: number;
+  errorMessage: string;
+}
+
+let clockDriftState: ClockDriftState = {
+  hasDriftError: false,
+  driftMs: 0,
+  lastCheckedAt: 0,
+  serverTimeEstimated: Date.now(),
+  errorMessage: "",
+};
+
+type ClockDriftListener = (state: ClockDriftState) => void;
+const clockDriftListeners = new Set<ClockDriftListener>();
+
+export function subscribeToClockDriftStatus(listener: ClockDriftListener): () => void {
+  clockDriftListeners.add(listener);
+  listener(clockDriftState);
+  return () => clockDriftListeners.delete(listener);
+}
+
+export function getClockDriftStatus(): ClockDriftState {
+  return { ...clockDriftState };
+}
+
+/**
+ * Checks clock drift against the backend server or trusted NTP time.
+ * If physical clock drift exceeds ±5 minutes, blocks local HLC mutations.
+ */
+export async function syncServerClockTime(): Promise<ClockDriftState> {
+  if (typeof window === "undefined") {
+    return clockDriftState;
+  }
+
+  const t0 = performance.now();
+  try {
+    const res = await fetch("/api/time", { cache: "no-store" });
+    const t1 = performance.now();
+    const roundTrip = t1 - t0;
+
+    if (res.ok) {
+      const data = await res.json();
+      const serverTime = Number(data.serverTime);
+      const localNow = Date.now();
+
+      // Estimated server time at response arrival
+      const serverEstimated = serverTime + Math.round(roundTrip / 2);
+      const drift = localNow - serverEstimated; // Positive: local is fast (in future); Negative: local is slow (in past)
+
+      const hasError = Math.abs(drift) > ARCHITECTURE_CONSTANTS.CLOCK_DRIFT_MAX_MS;
+      const minutesDrift = Math.round((drift / 60000) * 10) / 10;
+
+      clockDriftState = {
+        hasDriftError: hasError,
+        driftMs: drift,
+        lastCheckedAt: Date.now(),
+        serverTimeEstimated: serverEstimated,
+        errorMessage: hasError
+          ? `⚠️ خطأ في توقيت الجهاز: ساعة جهازك غير متطابقة مع توقيت السيرفر بفارق (${minutesDrift} دقيقة). تم إيقاف المزامنة مؤقتاً لحماية سلامة البيانات. يرجى ضبط توقيت جهازك.`
+          : "",
+      };
+
+      if (hasError) {
+        console.error(`[SyncEngine ClockDriftGuard] Physical clock drift exceeds threshold: ${drift}ms (${minutesDrift} mins). Mutations blocked.`);
+      }
+
+      clockDriftListeners.forEach((fn) => {
+        try {
+          fn(clockDriftState);
+        } catch {}
+      });
+    }
+  } catch (err) {
+    // If offline, preserve current drift knowledge
+    console.warn("[SyncEngine ClockDriftGuard] Could not query server time (offline or endpoint unreachable).");
+  }
+
+  return clockDriftState;
+}
+
+// Check clock on startup and periodically every 5 minutes
+if (typeof window !== "undefined") {
+  syncServerClockTime().catch(() => {});
+  setInterval(() => {
+    syncServerClockTime().catch(() => {});
+  }, 5 * 60 * 1000);
+}
+
+// --------------------------------------------------------------------------
+// 3. HYBRID LOGICAL CLOCK (HLC) IMPLEMENTATION
 // --------------------------------------------------------------------------
 
 class HybridLogicalClockEngine {
@@ -87,8 +216,16 @@ class HybridLogicalClockEngine {
 
   /**
    * Generates the next monotonic HLC for a local mutation.
+   * Throws an error if local device clock drift exceeds ±5 minutes to prevent HLC corruption.
    */
   public now(): HybridLogicalClock {
+    if (clockDriftState.hasDriftError) {
+      throw new Error(
+        clockDriftState.errorMessage ||
+          "Clock drift exceeds ±5 minutes. Local mutations are blocked to protect HLC monotonic integrity."
+      );
+    }
+
     const physicalTime = Date.now();
     this.monotonicSeq++;
 
@@ -141,7 +278,97 @@ class HybridLogicalClockEngine {
 export const HLCEngine = new HybridLogicalClockEngine(CURRENT_CLIENT_ID);
 
 // --------------------------------------------------------------------------
-// 3. DURABLE INDEXEDDB WRITE-AHEAD LOG (WAL) & TOMBSTONES
+// 4. 90-DAY LONG-OFFLINE ZOMBIE DATA GUARD
+// --------------------------------------------------------------------------
+
+interface ZombieGuardStatus {
+  isLongOfflineDetected: boolean;
+  daysOffline: number;
+  lastSyncAt: number;
+  pullFirstRequired: boolean;
+}
+
+export function checkZombieDataGuard(): ZombieGuardStatus {
+  if (typeof window === "undefined") {
+    return { isLongOfflineDetected: false, daysOffline: 0, lastSyncAt: Date.now(), pullFirstRequired: false };
+  }
+
+  const lastSyncStr = localStorage.getItem(LAST_SYNC_TS_KEY);
+  const lastSyncAt = lastSyncStr ? Number(lastSyncStr) : Date.now();
+  const diffMs = Date.now() - lastSyncAt;
+  const daysOffline = Math.floor(diffMs / (86400 * 1000));
+
+  const isLongOfflineDetected = diffMs > ARCHITECTURE_CONSTANTS.TOMBSTONE_MAX_AGE_MS;
+
+  return {
+    isLongOfflineDetected,
+    daysOffline,
+    lastSyncAt,
+    pullFirstRequired: isLongOfflineDetected,
+  };
+}
+
+export function recordSuccessfulSyncTimestamp(): void {
+  if (typeof window !== "undefined") {
+    localStorage.setItem(LAST_SYNC_TS_KEY, String(Date.now()));
+  }
+}
+
+/**
+ * Enforces a Full Reset & Pull-First Synchronization if a device was offline > 90 days.
+ * Prevents re-instantiating deleted "zombie" records whose server tombstones have expired.
+ */
+export async function executePullFirstReconciliation(
+  onPullFreshSnapshot: () => Promise<void>
+): Promise<{ success: boolean; message: string; archivedCount: number }> {
+  const guard = checkZombieDataGuard();
+  if (!guard.isLongOfflineDetected) {
+    recordSuccessfulSyncTimestamp();
+    return { success: true, message: "Device offline time within safe tombstone TTL window.", archivedCount: 0 };
+  }
+
+  console.warn(
+    `[SyncEngine ZombieGuard] Device offline for ${guard.daysOffline} days (> 90 days). Enforcing Pull-First reconciliation!`
+  );
+
+  // 1. Emergency Archive uncommitted local WAL records before wiping
+  const pendingWAL = getUncommittedWALRecords();
+  let archivedCount = 0;
+  if (pendingWAL.length > 0) {
+    const backup = await exportUnsyncedWALToJson(
+      pendingWAL,
+      CURRENT_CLIENT_ID,
+      "90_day_long_offline_zombie_protection_pre_reset"
+    );
+    archivedCount = backup.totalRecords;
+    console.log(`[SyncEngine ZombieGuard] Archived ${archivedCount} pending records to emergency storage.`);
+  }
+
+  // 2. Clear uncommitted local WAL to block zombie resurrection writes
+  memoryWALQueue.length = 0;
+  const idb = await getDB();
+  if (idb) {
+    try {
+      const tx = idb.transaction([ARCHITECTURE_DB_CONFIG.stores.WAL], "readwrite");
+      tx.objectStore(ARCHITECTURE_DB_CONFIG.stores.WAL).clear();
+    } catch {}
+  }
+
+  // 3. Pull fresh, authoritative snapshot from cloud
+  await onPullFreshSnapshot();
+
+  // 4. Update sync timestamp to restore normal operation
+  recordSuccessfulSyncTimestamp();
+
+  return {
+    success: true,
+    message: `تم تفعيل بروتوكول Pull-First لحماية المنظومة من إحياء البيانات المحذوفة بعد انقطاع ${guard.daysOffline} يوماً. تم أرشفة ${archivedCount} سجل محلي بأمان.`,
+    archivedCount,
+  };
+}
+
+// --------------------------------------------------------------------------
+// 5. DURABLE INDEXEDDB WRITE-AHEAD LOG (WAL) & TOMBSTONES
 // --------------------------------------------------------------------------
 
 let idbPromise: Promise<IDBDatabase | null> | null = null;
@@ -178,6 +405,9 @@ async function getDB(): Promise<IDBDatabase | null> {
         if (!db.objectStoreNames.contains(stores.IDEMPOTENCY_KEYS)) {
           db.createObjectStore(stores.IDEMPOTENCY_KEYS, { keyPath: "key" });
         }
+        if (!db.objectStoreNames.contains(stores.EMERGENCY_BACKUPS)) {
+          db.createObjectStore(stores.EMERGENCY_BACKUPS, { keyPath: "backupId" });
+        }
       };
 
       req.onsuccess = (e) => {
@@ -194,8 +424,13 @@ async function getDB(): Promise<IDBDatabase | null> {
   return idbPromise;
 }
 
+// Initialize Storage Persistence on app boot
+if (typeof window !== "undefined") {
+  requestStoragePersistence().catch(() => {});
+}
+
 // --------------------------------------------------------------------------
-// 4. IDEMPOTENCY & TOMBSTONE STORE
+// 6. IDEMPOTENCY & TOMBSTONE STORE
 // --------------------------------------------------------------------------
 
 // In-memory cache for sub-millisecond lookups
@@ -294,7 +529,7 @@ export async function recordTombstone(
     deletedBy,
     reason,
     createdAt: Date.now(),
-    ttlMs: 90 * 86400 * 1000,
+    ttlMs: ARCHITECTURE_CONSTANTS.TOMBSTONE_MAX_AGE_MS,
     purged: false,
   };
 
@@ -322,11 +557,15 @@ export async function recordTombstone(
 }
 
 // --------------------------------------------------------------------------
-// 5. WRITE-AHEAD LOG (WAL) WRITER & RETRIEVAL
+// 7. WRITE-AHEAD LOG (WAL) WRITER & RETRIEVAL
 // --------------------------------------------------------------------------
 
 // In-memory queue for <1ms zero-latency writes
 const memoryWALQueue: WALRecord[] = [];
+
+export function getUncommittedWALRecords(): WALRecord[] {
+  return [...memoryWALQueue];
+}
 
 export interface AppendWALParams {
   idempotencyKey: string;
@@ -379,11 +618,9 @@ export async function appendWALRecord(params: AppendWALParams): Promise<WALRecor
 }
 
 // --------------------------------------------------------------------------
-// 6. SAFE 4-SECOND COALESCING BATCH WRITER (Rate-Limit & Quota Protection)
+// 8. SAFE 4-SECOND COALESCING BATCH WRITER (Rate-Limit & Quota Protection)
 // --------------------------------------------------------------------------
 
-const BATCH_COALESCE_INTERVAL_MS = 4000;
-const MAX_BATCH_SIZE = 50;
 let batchTimer: ReturnType<typeof setTimeout> | null = null;
 let isFlushingBatch = false;
 let consecutiveRateLimitFailures = 0;
@@ -396,7 +633,7 @@ function scheduleBatchCoalesce(): void {
     flushCoalescedBatch().catch((err) => {
       console.warn("[SyncEngine] Coalesced batch flush notice:", err);
     });
-  }, BATCH_COALESCE_INTERVAL_MS);
+  }, ARCHITECTURE_CONSTANTS.BATCH_COALESCE_INTERVAL_MS);
 }
 
 /**
@@ -407,31 +644,22 @@ export async function flushCoalescedBatch(forceImmediate = false): Promise<numbe
   if (memoryWALQueue.length === 0) return 0;
   if (typeof window !== "undefined" && !navigator.onLine && !forceImmediate) return 0;
 
+  // Verify clock drift before pushing cloud writes
+  if (clockDriftState.hasDriftError) {
+    console.warn("[SyncEngine] Batch flush postponed: Server clock drift guard active.");
+    return 0;
+  }
+
   isFlushingBatch = true;
-  const batchToFlush = memoryWALQueue.slice(0, MAX_BATCH_SIZE);
+  const batchToFlush = memoryWALQueue.slice(0, ARCHITECTURE_CONSTANTS.MAX_BATCH_SIZE);
   const flushedWalIds: string[] = [];
 
   try {
-    // 1. Group records by entity type
-    const attendanceRecords: WALRecord[] = [];
-    const studentRecords: WALRecord[] = [];
-    const ledgerRecords: WALRecord[] = [];
-    const tombstoneRecords: WALRecord[] = [];
-
     for (const record of batchToFlush) {
       record.status = "COALESCING";
-      if (record.action === "DELETE") {
-        tombstoneRecords.push(record);
-      } else if (record.entityType === "ATTENDANCE") {
-        attendanceRecords.push(record);
-      } else if (record.entityType === "STUDENT") {
-        studentRecords.push(record);
-      } else if (record.entityType === "FINANCIAL_LEDGER") {
-        ledgerRecords.push(record);
-      }
     }
 
-    // 2. Commit Firestore Batched Writes
+    // Commit Firestore Batched Writes
     await ensureFirebaseAuth();
     const fbBatch = writeBatch(db);
 
@@ -465,7 +693,7 @@ export async function flushCoalescedBatch(forceImmediate = false): Promise<numbe
 
     await fbBatch.commit();
 
-    // 3. Mark processed in WAL
+    // Mark processed in WAL
     const flushedSet = new Set(flushedWalIds);
     for (let i = memoryWALQueue.length - 1; i >= 0; i--) {
       if (flushedSet.has(memoryWALQueue[i].walId)) {
@@ -484,6 +712,7 @@ export async function flushCoalescedBatch(forceImmediate = false): Promise<numbe
     }
 
     consecutiveRateLimitFailures = 0;
+    recordSuccessfulSyncTimestamp();
   } catch (err: any) {
     const isRateLimit = err?.code === "resource-exhausted" || err?.status === 429;
     if (isRateLimit) {
