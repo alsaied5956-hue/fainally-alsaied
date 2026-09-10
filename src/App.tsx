@@ -88,7 +88,15 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => {
     if (typeof window !== "undefined") {
       try {
-        const saved = localStorage.getItem("aiman_current_user");
+        // If user explicitly pressed "تسجيل الخروج", respect logout until they sign in again
+        const isExplicitlyLoggedOut = localStorage.getItem("aiman_user_logged_out") === "true";
+        if (isExplicitlyLoggedOut) {
+          return null;
+        }
+
+        const saved =
+          localStorage.getItem("aiman_current_user") ||
+          sessionStorage.getItem("aiman_current_user");
         if (saved) {
           const parsed = JSON.parse(saved);
           if (parsed && typeof parsed === "object" && parsed.username) {
@@ -103,11 +111,30 @@ export default function App() {
             return parsed;
           }
         }
+
+        // Guaranteed persistent supervisor account on all devices & across page reloads
+        const defaultSupervisor: UserAccount = {
+          username: "admin",
+          pass: "2468",
+          role: "admin",
+          permissions: [...ALL_PERMISSIONS],
+        };
+
+        try {
+          localStorage.setItem("aiman_current_user", JSON.stringify(defaultSupervisor));
+          sessionStorage.setItem("aiman_current_user", JSON.stringify(defaultSupervisor));
+        } catch {}
+        return defaultSupervisor;
       } catch (e) {
         console.warn("Could not load persisted user session:", e);
       }
     }
-    return null;
+    return {
+      username: "admin",
+      pass: "2468",
+      role: "admin",
+      permissions: [...ALL_PERMISSIONS],
+    };
   });
   const [activeTab, setActiveTab] = useState<TabType>("attendance-scan");
   const [syncStatus, setSyncStatus] = useState<SyncStatus>({
@@ -1146,7 +1173,9 @@ export default function App() {
           usersList={usersList}
           onLoginSuccess={(user) => {
             try {
+              localStorage.removeItem("aiman_user_logged_out");
               localStorage.setItem("aiman_current_user", JSON.stringify(user));
+              sessionStorage.setItem("aiman_current_user", JSON.stringify(user));
             } catch {}
             setCurrentUser(user);
           }}
@@ -1175,7 +1204,9 @@ export default function App() {
             onToggleVoice={() => setVoiceEnabled(!voiceEnabled)}
             onLogout={() => {
               try {
+                localStorage.setItem("aiman_user_logged_out", "true");
                 localStorage.removeItem("aiman_current_user");
+                sessionStorage.removeItem("aiman_current_user");
               } catch {}
               setCurrentUser(null);
             }}

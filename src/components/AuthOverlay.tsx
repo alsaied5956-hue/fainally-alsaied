@@ -27,9 +27,11 @@ export const AuthOverlay: React.FC<AuthOverlayProps> = ({
   };
 
   const executeLogin = (user: UserAccount) => {
-    if (rememberDevice && typeof window !== "undefined") {
+    if (typeof window !== "undefined") {
       try {
+        localStorage.removeItem("aiman_user_logged_out");
         localStorage.setItem("aiman_current_user", JSON.stringify(user));
+        sessionStorage.setItem("aiman_current_user", JSON.stringify(user));
       } catch (err) {
         console.warn("Could not persist session:", err);
       }
