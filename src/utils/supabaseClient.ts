@@ -183,67 +183,130 @@ export async function broadcastStudentChange(payload: StudentSyncPayload): Promi
 }
 
 // ------------------------------------------------------------------------
-// 3. LISTENERS (Instant Reception on All Devices)
+// 3. LISTENERS (Instant Reception on All Devices with Zero-Leak Lifecycle)
 // ------------------------------------------------------------------------
+
+const liveScanListeners = new Set<(payload: LiveScanPayload) => void>();
+const groupFinishedListeners = new Set<(payload: GroupFinishedPayload) => void>();
+const paymentChangeListeners = new Set<(payload: PaymentSyncPayload) => void>();
+const homeworkChangeListeners = new Set<(payload: HomeworkSyncPayload) => void>();
+const studentChangeListeners = new Set<(payload: StudentSyncPayload) => void>();
+let listenersInitialized = false;
+
+function ensureChannelListenersRegistered() {
+  if (listenersInitialized) return;
+  listenersInitialized = true;
+  const channel = getOrCreateRealtimeHub();
+
+  channel.on("broadcast", { event: "assistant_scan" }, ({ payload }) => {
+    if (payload) {
+      liveScanListeners.forEach((fn) => {
+        try {
+          fn(payload as LiveScanPayload);
+        } catch (e) {
+          console.warn("Error in liveScan listener:", e);
+        }
+      });
+    }
+  });
+
+  channel.on("broadcast", { event: "group_finished" }, ({ payload }) => {
+    if (payload) {
+      groupFinishedListeners.forEach((fn) => {
+        try {
+          fn(payload as GroupFinishedPayload);
+        } catch (e) {
+          console.warn("Error in groupFinished listener:", e);
+        }
+      });
+    }
+  });
+
+  channel.on("broadcast", { event: "payment_change" }, ({ payload }) => {
+    if (payload) {
+      paymentChangeListeners.forEach((fn) => {
+        try {
+          fn(payload as PaymentSyncPayload);
+        } catch (e) {
+          console.warn("Error in paymentChange listener:", e);
+        }
+      });
+    }
+  });
+
+  channel.on("broadcast", { event: "homework_change" }, ({ payload }) => {
+    if (payload) {
+      homeworkChangeListeners.forEach((fn) => {
+        try {
+          fn(payload as HomeworkSyncPayload);
+        } catch (e) {
+          console.warn("Error in homeworkChange listener:", e);
+        }
+      });
+    }
+  });
+
+  channel.on("broadcast", { event: "student_change" }, ({ payload }) => {
+    if (payload) {
+      studentChangeListeners.forEach((fn) => {
+        try {
+          fn(payload as StudentSyncPayload);
+        } catch (e) {
+          console.warn("Error in studentChange listener:", e);
+        }
+      });
+    }
+  });
+}
 
 export function subscribeToLiveScans(
   onScanReceived: (payload: LiveScanPayload) => void
 ): () => void {
-  const channel = getOrCreateRealtimeHub();
-  channel.on("broadcast", { event: "assistant_scan" }, ({ payload }) => {
-    if (payload && typeof onScanReceived === "function") {
-      onScanReceived(payload as LiveScanPayload);
-    }
-  });
-  return () => {};
+  ensureChannelListenersRegistered();
+  liveScanListeners.add(onScanReceived);
+  return () => {
+    liveScanListeners.delete(onScanReceived);
+  };
 }
 
 export function subscribeToGroupFinished(
   onGroupFinished: (payload: GroupFinishedPayload) => void
 ): () => void {
-  const channel = getOrCreateRealtimeHub();
-  channel.on("broadcast", { event: "group_finished" }, ({ payload }) => {
-    if (payload && typeof onGroupFinished === "function") {
-      onGroupFinished(payload as GroupFinishedPayload);
-    }
-  });
-  return () => {};
+  ensureChannelListenersRegistered();
+  groupFinishedListeners.add(onGroupFinished);
+  return () => {
+    groupFinishedListeners.delete(onGroupFinished);
+  };
 }
 
 export function subscribeToPaymentChanges(
   onPaymentChanged: (payload: PaymentSyncPayload) => void
 ): () => void {
-  const channel = getOrCreateRealtimeHub();
-  channel.on("broadcast", { event: "payment_change" }, ({ payload }) => {
-    if (payload && typeof onPaymentChanged === "function") {
-      onPaymentChanged(payload as PaymentSyncPayload);
-    }
-  });
-  return () => {};
+  ensureChannelListenersRegistered();
+  paymentChangeListeners.add(onPaymentChanged);
+  return () => {
+    paymentChangeListeners.delete(onPaymentChanged);
+  };
 }
 
 export function subscribeToHomeworkChanges(
   onHomeworkChanged: (payload: HomeworkSyncPayload) => void
 ): () => void {
-  const channel = getOrCreateRealtimeHub();
-  channel.on("broadcast", { event: "homework_change" }, ({ payload }) => {
-    if (payload && typeof onHomeworkChanged === "function") {
-      onHomeworkChanged(payload as HomeworkSyncPayload);
-    }
-  });
-  return () => {};
+  ensureChannelListenersRegistered();
+  homeworkChangeListeners.add(onHomeworkChanged);
+  return () => {
+    homeworkChangeListeners.delete(onHomeworkChanged);
+  };
 }
 
 export function subscribeToStudentChanges(
   onStudentChanged: (payload: StudentSyncPayload) => void
 ): () => void {
-  const channel = getOrCreateRealtimeHub();
-  channel.on("broadcast", { event: "student_change" }, ({ payload }) => {
-    if (payload && typeof onStudentChanged === "function") {
-      onStudentChanged(payload as StudentSyncPayload);
-    }
-  });
-  return () => {};
+  ensureChannelListenersRegistered();
+  studentChangeListeners.add(onStudentChanged);
+  return () => {
+    studentChangeListeners.delete(onStudentChanged);
+  };
 }
 
 // ------------------------------------------------------------------------

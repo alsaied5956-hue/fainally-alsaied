@@ -134,7 +134,7 @@ function compactPayments(payments: any): any {
     for (const [key, p] of Object.entries(monthData as Record<string, any>)) {
       if (!p || typeof p !== "object") continue;
       const c: Record<string, any> = { a: p.amount, d: p.date, t: p.time };
-      if (p.note && !p.note.startsWith("اشتراك شهر")) c.n = p.note;
+      if (p.note && !p.note.startsWith("اشتراك شهر")) c.n = String(p.note).substring(0, 150);
       if (p.receiptNo) c.r = p.receiptNo;
       if (p.isCardFee) c.c = 1;
       if (p.recordedBy && p.recordedBy !== "admin") c.by = p.recordedBy;

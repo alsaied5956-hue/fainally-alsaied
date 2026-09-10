@@ -143,6 +143,17 @@ let quotaExceededUntil: number = 0;
 const syncStatusListeners: Array<(status: SyncStatus) => void> = [];
 const cloudDataListeners: Array<(data: SystemData) => void> = [];
 
+// Safe note merger to prevent duplicate or unbounded concatenated notes
+function safeMergeNotes(n1?: string, n2?: string): string {
+  if (!n1) return (n2 || "").substring(0, 150);
+  if (!n2) return (n1 || "").substring(0, 150);
+  if (n1 === n2) return n1.substring(0, 150);
+  const parts1 = String(n1).split("|").map(s => s.trim()).filter(Boolean);
+  const parts2 = String(n2).split("|").map(s => s.trim()).filter(Boolean);
+  const unique = Array.from(new Set([...parts1, ...parts2]));
+  return unique.join(" | ").substring(0, 150);
+}
+
 // Inter-tab / Inter-window BroadcastChannel for 0ms cross-tab real-time sync on the same device
 let broadcastChannel: BroadcastChannel | null = null;
 if (typeof window !== "undefined" && "BroadcastChannel" in window) {
@@ -284,6 +295,7 @@ export function normalizeAndMigratePayments(rawPayments: any): Record<string, Re
       if (!result[mKey]) result[mKey] = {};
       result[mKey][p.barcode] = {
         ...p,
+        note: safeMergeNotes(p.note),
         monthKey: mKey,
         month: mKey,
       };
@@ -310,6 +322,7 @@ export function normalizeAndMigratePayments(rawPayments: any): Record<string, Re
         if (!result[mKey]) result[mKey] = {};
         result[mKey][barcode] = {
           ...p,
+          note: safeMergeNotes(p.note),
           barcode,
           monthKey: mKey,
           month: mKey,
@@ -329,6 +342,7 @@ export function normalizeAndMigratePayments(rawPayments: any): Record<string, Re
           if (!pRecord) continue;
           result[mKey][bCode] = {
             ...pRecord,
+            note: safeMergeNotes(pRecord.note),
             barcode: pRecord.barcode || bCode,
             monthKey: mKey,
             month: mKey,
@@ -570,34 +584,18 @@ export async function hydrateFromIndexedDB(): Promise<void> {
   }
 }
 
-/**
- * Save data to browser LocalStorage & IndexedDB with multi-tier fail-safe resilience.
- * Guaranteed zero quota-exceeded crashes.
- */
-export function saveToLocalStorage(data: SystemData, updateTimestamp: boolean = true): void {
-  const todayKey = getTodayKey();
-  const clonedData: SystemData = {
-    ...data,
-    attendanceHistory: {
-      ...(data.attendanceHistory || {}),
-      [todayKey]: data.attendanceToday || {},
-    },
-    updatedAt: updateTimestamp ? Date.now() : (data.updatedAt || Date.now()),
-  };
+let diskSaveTimeout: ReturnType<typeof setTimeout> | null = null;
+let latestDataForDiskSave: SystemData | null = null;
 
-  memoryCachedData = clonedData;
-
-  // 1. Asynchronously persist full unabridged snapshot into IndexedDB (High capacity, zero quota issues)
-  if (typeof window !== "undefined") {
-    saveSnapshotToIndexedDB(STORAGE_KEY, clonedData).catch(() => {});
-  }
-
+function performDiskPersist(clonedData: SystemData) {
   if (typeof window === "undefined" || typeof localStorage === "undefined") {
-    broadcastLocalChange(clonedData);
     return;
   }
 
-  // 2. Synchronously save to LocalStorage with fallback strategies to prevent QuotaExceededError
+  // 1. Asynchronously persist full unabridged snapshot into IndexedDB (High capacity, zero quota issues)
+  saveSnapshotToIndexedDB(STORAGE_KEY, clonedData).catch(() => {});
+
+  // 2. Save to LocalStorage with fallback strategies to prevent QuotaExceededError
   try {
     // Strategy A: Compacted payload (lossless, 60-75% smaller than raw JSON)
     const compacted = compactSystemPayload(clonedData);
@@ -634,8 +632,39 @@ export function saveToLocalStorage(data: SystemData, updateTimestamp: boolean = 
       }
     }
   }
+}
 
+/**
+ * Save data to browser LocalStorage & IndexedDB with multi-tier fail-safe resilience.
+ * Guaranteed zero quota-exceeded crashes and zero UI thread freezes.
+ */
+export function saveToLocalStorage(data: SystemData, updateTimestamp: boolean = true): void {
+  const todayKey = getTodayKey();
+  const clonedData: SystemData = {
+    ...data,
+    attendanceHistory: {
+      ...(data.attendanceHistory || {}),
+      [todayKey]: data.attendanceToday || {},
+    },
+    updatedAt: updateTimestamp ? Date.now() : (data.updatedAt || Date.now()),
+  };
+
+  // Immediate 0ms in-memory update for instant responsiveness
+  memoryCachedData = clonedData;
   broadcastLocalChange(clonedData);
+
+  // Debounce disk writes by 80ms so consecutive rapid barcode scans do not repeatedly run CPU-heavy compression
+  latestDataForDiskSave = clonedData;
+  if (diskSaveTimeout) {
+    clearTimeout(diskSaveTimeout);
+  }
+  diskSaveTimeout = setTimeout(() => {
+    diskSaveTimeout = null;
+    if (latestDataForDiskSave) {
+      performDiskPersist(latestDataForDiskSave);
+      latestDataForDiskSave = null;
+    }
+  }, 80);
 }
 
 /**
@@ -1350,10 +1379,7 @@ export function mergeCloudDataWithLocal(local: SystemData, cloud: Partial<System
               mergedPayments[mKey][bCode] = { ...remoteRec, ...localRec };
             } else {
               const chosen = remoteAmt > localAmt ? remoteRec : localRec;
-              const combinedNote = [localRec.note, remoteRec.note]
-                .filter(Boolean)
-                .filter((v, i, a) => a.indexOf(v) === i)
-                .join(" | ");
+              const combinedNote = safeMergeNotes(localRec.note, remoteRec.note);
               mergedPayments[mKey][bCode] = {
                 ...localRec,
                 ...remoteRec,

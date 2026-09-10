@@ -180,9 +180,26 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     time: string;
   } | null>(null);
 
-  // ⚡ Listen to instant scans across all assistant devices
+  // Keep latest references for callbacks without re-subscribing
+  const studentsRef = useRef(students);
+  studentsRef.current = students;
+  const onRecordAttendanceRef = useRef(onRecordAttendance);
+  onRecordAttendanceRef.current = onRecordAttendance;
+  const processedScansSet = useRef(new Set<string>());
+
+  // ⚡ Listen to instant scans across all assistant devices (Zero Memory Leak)
   useEffect(() => {
     const unsubscribe = subscribeToLiveScans((payload: LiveScanPayload) => {
+      // De-duplicate if received recently
+      const scanKey = `${payload.barcode}_${payload.timestamp}`;
+      if (processedScansSet.current.has(scanKey)) return;
+      processedScansSet.current.add(scanKey);
+
+      // Keep set bounded
+      if (processedScansSet.current.size > 200) {
+        processedScansSet.current.clear();
+      }
+
       setLiveAssistantNotice({
         name: payload.name,
         status: payload.status,
@@ -196,11 +213,11 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
       }, 4000);
 
       // Record in local state if student exists
-      const targetStudent = (students || []).find(
+      const targetStudent = (studentsRef.current || []).find(
         (s) => String(s.barcode).trim() === String(payload.barcode).trim()
       );
-      if (targetStudent && onRecordAttendance) {
-        onRecordAttendance(
+      if (targetStudent && onRecordAttendanceRef.current) {
+        onRecordAttendanceRef.current(
           payload.barcode,
           payload.status as "حضور" | "تأخير",
           payload.timeIso,
@@ -214,7 +231,7 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     return () => {
       unsubscribe();
     };
-  }, [students, onRecordAttendance]);
+  }, []);
 
   // Sync selected group to localStorage
   const handleGradeChange = (grade: GradeName) => {

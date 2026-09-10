@@ -329,6 +329,10 @@ export default function App() {
     }
   };
 
+  // Keep latest students reference for realtime events
+  const appStudentsRef = useRef(students);
+  appStudentsRef.current = students;
+
   // ⚡ Central Supabase Realtime Hub: Listen to Group Finalization, Payments, and Students across all devices (<20ms)
   useEffect(() => {
     const unsubGroup = subscribeToGroupFinished((payload) => {
@@ -358,12 +362,12 @@ export default function App() {
       // Clear the finished grade from active scanner list
       setScanLogOrder((prev) => {
         const gradeMap = new Map<string, string>();
-        students.forEach((s) => s.barcode && gradeMap.set(String(s.barcode).trim(), s.groupGrade));
+        (appStudentsRef.current || []).forEach((s) => s.barcode && gradeMap.set(String(s.barcode).trim(), s.groupGrade));
         return prev.filter((b) => gradeMap.get(String(b).trim()) !== payload.grade);
       });
       setScanLogTimes((prev) => {
         const next = { ...prev };
-        students.forEach((s) => {
+        (appStudentsRef.current || []).forEach((s) => {
           if (s.groupGrade === payload.grade) delete next[String(s.barcode).trim()];
         });
         return next;
@@ -424,7 +428,7 @@ export default function App() {
       unsubPayment();
       unsubStudent();
     };
-  }, [students]);
+  }, []);
 
   // Handler: Scan Attendance Record
   const handleRecordAttendance = useCallback((
