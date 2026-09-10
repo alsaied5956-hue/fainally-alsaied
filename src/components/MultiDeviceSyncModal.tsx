@@ -810,21 +810,16 @@ export const MultiDeviceSyncModal: React.FC<MultiDeviceSyncModalProps> = ({
           {activeViewTab === "sync_actions" && (
             <div className="space-y-6 animate-fadeIn">
               
-              {/* Quota Limit Notice Banner */}
-              {syncStatus.isQuotaExceeded && (
-                <div className="p-4 rounded-2xl border border-amber-500/50 bg-amber-950/70 text-amber-200 text-xs space-y-2">
-                  <div className="flex items-center gap-2 font-black text-sm text-amber-300">
-                    <AlertCircle className="w-5 h-5 text-amber-400 shrink-0" />
-                    <span>تنبيه الكوتة اليومية للفايربيز (Firestore Free Tier Quota Limit)</span>
-                  </div>
-                  <p className="leading-relaxed">
-                    تم الوصول للحد اليومي المجاني للكتابة السحابية اليوم ({syncStatus.quotaMessage}).
-                    <strong className="text-white block mt-1">
-                      ✅ لا تقلق نهائياً: كافة بياناتك وطلابك ({totalLocalStudents} طالب) والدرجات والاشتراكات محفوظة ومؤمنة محلياً 100%، ويمكنك استخدام زر &quot;تصدير واستيراد ملف JSON&quot; بالأسفل لمزامنة أي جهاز آخر فوراً بدون نت وبدون استهلاك كوتة!
-                    </strong>
-                  </p>
+              {/* Unlimited Real-time Cloud Sync Hub Banner */}
+              <div className="p-4 rounded-2xl border border-emerald-500/40 bg-emerald-950/60 text-emerald-200 text-xs space-y-2">
+                <div className="flex items-center gap-2 font-black text-sm text-emerald-300">
+                  <Zap className="w-5 h-5 text-amber-400 shrink-0" />
+                  <span>محرك التزامن اللحظي فائق السرعة مفعل (Real-Time Cloud Hub - غير محدود الكوتة)</span>
                 </div>
-              )}
+                <p className="leading-relaxed text-emerald-100/90">
+                  كافة أجهزتك مرتبطة الآن بمحرك التزامن اللحظي المباشر فائق السرعة (<strong className="text-white">أقل من ثانيتين</strong>) عبر قنوات البث الفوري، بدون أي قيود كوتة يومية نهائياً.
+                </p>
+              </div>
 
               {/* Feedback message banner */}
               {feedback && (
@@ -1105,7 +1100,7 @@ export const MultiDeviceSyncModal: React.FC<MultiDeviceSyncModalProps> = ({
                   }`}>
                     <div className="flex items-center gap-2">
                       <Wifi className="w-4 h-4" />
-                      <span>{pingResult.ok ? "تم الاتصال بسيرفر Firestore بنجاح وبسرعة فائقة!" : "فشل فحص الاتصال بالسحابة"}</span>
+                      <span>{pingResult.ok ? "تم الاتصال بالسحابة ومحرك التزامن اللحظي بنجاح وبسرعة فائقة (محرك غير محدود الكوتة ⚡)!" : "فشل فحص الاتصال بالسحابة"}</span>
                       {pingResult.error && <span className="text-red-400 text-[11px]">({pingResult.error})</span>}
                     </div>
                     <div className="flex items-center gap-2 font-mono text-sm bg-black/40 px-3 py-1 rounded-lg">

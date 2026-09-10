@@ -182,6 +182,20 @@ export async function broadcastStudentChange(payload: StudentSyncPayload): Promi
   }
 }
 
+/** Broadcast full state changes across all connected devices (< 50ms peer delivery) */
+export async function broadcastFullState(payload: any): Promise<void> {
+  try {
+    const channel = getOrCreateRealtimeHub();
+    await channel.send({
+      type: "broadcast",
+      event: "full_state_sync",
+      payload,
+    });
+  } catch (err) {
+    console.warn("Realtime broadcast full state notice:", err);
+  }
+}
+
 // ------------------------------------------------------------------------
 // 3. LISTENERS (Instant Reception on All Devices with Zero-Leak Lifecycle)
 // ------------------------------------------------------------------------
@@ -191,12 +205,25 @@ const groupFinishedListeners = new Set<(payload: GroupFinishedPayload) => void>(
 const paymentChangeListeners = new Set<(payload: PaymentSyncPayload) => void>();
 const homeworkChangeListeners = new Set<(payload: HomeworkSyncPayload) => void>();
 const studentChangeListeners = new Set<(payload: StudentSyncPayload) => void>();
+const fullStateListeners = new Set<(payload: any) => void>();
 let listenersInitialized = false;
 
 function ensureChannelListenersRegistered() {
   if (listenersInitialized) return;
   listenersInitialized = true;
   const channel = getOrCreateRealtimeHub();
+
+  channel.on("broadcast", { event: "full_state_sync" }, ({ payload }) => {
+    if (payload) {
+      fullStateListeners.forEach((fn) => {
+        try {
+          fn(payload);
+        } catch (e) {
+          console.warn("Error in fullState listener:", e);
+        }
+      });
+    }
+  });
 
   channel.on("broadcast", { event: "assistant_scan" }, ({ payload }) => {
     if (payload) {
@@ -306,6 +333,16 @@ export function subscribeToStudentChanges(
   studentChangeListeners.add(onStudentChanged);
   return () => {
     studentChangeListeners.delete(onStudentChanged);
+  };
+}
+
+export function subscribeToFullState(
+  onFullStateReceived: (payload: any) => void
+): () => void {
+  ensureChannelListenersRegistered();
+  fullStateListeners.add(onFullStateReceived);
+  return () => {
+    fullStateListeners.delete(onFullStateReceived);
   };
 }
 

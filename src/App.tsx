@@ -84,7 +84,18 @@ import { pushLiveAttendanceEvent, pushLiveAttendanceBatch } from "./utils/liveEv
 import { CheckCircle2, WifiOff, RefreshCw, X, MessageSquare, Send } from "lucide-react";
 
 export default function App() {
-  const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
+  const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const saved = localStorage.getItem("center_current_user");
+        if (saved) {
+          const u = JSON.parse(saved);
+          if (u && u.username) return u;
+        }
+      } catch {}
+    }
+    return null;
+  });
   const [activeTab, setActiveTab] = useState<TabType>("attendance-scan");
   const [syncStatus, setSyncStatus] = useState<SyncStatus>({
     isOnline: true,
@@ -153,18 +164,18 @@ export default function App() {
     }
   }, [theme]);
 
-  // Core Datasets with guaranteed initial default arrays/objects
-  const [students, setStudents] = useState<Student[]>([]);
-  const [attendanceToday, setAttendanceToday] = useState<Record<string, string>>({});
-  const [attendanceHistory, setAttendanceHistory] = useState<Record<string, Record<string, string>>>({});
-  const [scanLogOrder, setScanLogOrder] = useState<string[]>([]);
-  const [scanLogTimes, setScanLogTimes] = useState<Record<string, string>>({});
-  const [payments, setPayments] = useState<Record<string, Record<string, PaymentRecord>>>({});
-  const [groupPrices, setGroupPrices] = useState<Record<GradeName, number>>({} as Record<GradeName, number>);
-  const [usersList, setUsersList] = useState<UserAccount[]>([]);
-  const [platformMessages, setPlatformMessages] = useState<PlatformMessage[]>([]);
-  const [pendingWhatsAppMessages, setPendingWhatsAppMessages] = useState<PendingWhatsAppMessage[]>([]);
-  const [gradeWhatsAppLinks, setGradeWhatsAppLinks] = useState<Record<string, string>>({});
+  // Core Datasets with guaranteed initial default arrays/objects loaded immediately on 0ms first render
+  const [students, setStudents] = useState<Student[]>(() => loadInitialData().students || []);
+  const [attendanceToday, setAttendanceToday] = useState<Record<string, string>>(() => loadInitialData().attendanceToday || {});
+  const [attendanceHistory, setAttendanceHistory] = useState<Record<string, Record<string, string>>>(() => loadInitialData().attendanceHistory || {});
+  const [scanLogOrder, setScanLogOrder] = useState<string[]>(() => loadInitialData().scanLogOrder || []);
+  const [scanLogTimes, setScanLogTimes] = useState<Record<string, string>>(() => loadInitialData().scanLogTimes || {});
+  const [payments, setPayments] = useState<Record<string, Record<string, PaymentRecord>>>(() => loadInitialData().payments || {});
+  const [groupPrices, setGroupPrices] = useState<Record<GradeName, number>>(() => loadInitialData().groupPrices || ({} as Record<GradeName, number>));
+  const [usersList, setUsersList] = useState<UserAccount[]>(() => loadInitialData().usersList || []);
+  const [platformMessages, setPlatformMessages] = useState<PlatformMessage[]>(() => loadInitialData().platformMessages || []);
+  const [pendingWhatsAppMessages, setPendingWhatsAppMessages] = useState<PendingWhatsAppMessage[]>(() => loadInitialData().pendingWhatsAppMessages || []);
+  const [gradeWhatsAppLinks, setGradeWhatsAppLinks] = useState<Record<string, string>>(() => loadInitialData().gradeWhatsAppLinks || {});
   const [isWhatsAppOutboxOpen, setIsWhatsAppOutboxOpen] = useState<boolean>(false);
 
   // Print PDF Modal State
@@ -1124,7 +1135,12 @@ export default function App() {
       {!currentUser && (
         <AuthOverlay
           usersList={usersList}
-          onLoginSuccess={(user) => setCurrentUser(user)}
+          onLoginSuccess={(user) => {
+            setCurrentUser(user);
+            try {
+              localStorage.setItem("center_current_user", JSON.stringify(user));
+            } catch {}
+          }}
         />
       )}
 
@@ -1148,7 +1164,12 @@ export default function App() {
             onToggleTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
             voiceEnabled={voiceEnabled}
             onToggleVoice={() => setVoiceEnabled(!voiceEnabled)}
-            onLogout={() => setCurrentUser(null)}
+            onLogout={() => {
+              setCurrentUser(null);
+              try {
+                localStorage.removeItem("center_current_user");
+              } catch {}
+            }}
             activeSessionSlotId={activeSessionSlotId}
             onChangeSessionSlot={(slotId) => setActiveSessionSlotId(slotId)}
             onOpenQuickScan={() => setActiveTab("attendance-scan")}

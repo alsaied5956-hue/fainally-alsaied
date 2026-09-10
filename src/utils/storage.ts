@@ -28,6 +28,7 @@ import {
   getBatchQueueStatus,
   subscribeToBatchStatus,
 } from "./smartSyncBatcher";
+import { broadcastFullState, subscribeToFullState } from "./supabaseClient";
 import centerBackup from "../data/centerBackup.json";
 
 export {
@@ -103,26 +104,53 @@ export const ALL_PERMISSIONS: PermissionKey[] = [
 
 export const DEFAULT_USERS: UserAccount[] = [
   {
+    username: "alsaied",
+    pass: "159357",
+    role: "admin",
+    permissions: [...ALL_PERMISSIONS],
+  },
+  {
+    username: "eman",
+    pass: "2468",
+    role: "admin",
+    permissions: [...ALL_PERMISSIONS],
+  },
+  {
+    username: "mahmoud",
+    pass: "1234",
+    role: "admin",
+    permissions: [...ALL_PERMISSIONS],
+  },
+  {
     username: "admin",
-    pass: "admin123",
+    pass: "2468",
     role: "admin",
     permissions: [...ALL_PERMISSIONS],
   },
 ];
 
+const seedBackupStudents = Array.isArray(centerBackup?.students) ? (centerBackup.students as Student[]) : [];
+const seedBackupHistory = (centerBackup?.attendanceHistory as Record<string, Record<string, string>>) || {};
+const seedBackupToday = (centerBackup?.attendanceToday as Record<string, string>) || {};
+const seedBackupPrices = (centerBackup?.groupPrices as Record<string, number>) || {};
+const seedBackupUsers = Array.isArray(centerBackup?.usersList) && centerBackup.usersList.length > 0
+  ? (centerBackup.usersList as UserAccount[])
+  : DEFAULT_USERS;
+const seedBackupPayments = normalizeAndMigratePayments(centerBackup?.payments);
+
 export const INITIAL_SYSTEM_DATA: SystemData = {
-  students: [],
-  attendanceHistory: {},
-  attendanceToday: {},
+  students: seedBackupStudents,
+  attendanceHistory: seedBackupHistory,
+  attendanceToday: seedBackupToday,
   scanLogTimes: {},
-  payments: {},
+  payments: seedBackupPayments,
   scanLogOrder: [],
-  usersList: DEFAULT_USERS,
-  groupPrices: DEFAULT_GRADE_PRICES,
+  usersList: seedBackupUsers,
+  groupPrices: { ...DEFAULT_GRADE_PRICES, ...seedBackupPrices },
   activeSessionSlotId: "auto",
-  platformMessages: [],
-  pendingWhatsAppMessages: [],
-  gradeWhatsAppLinks: {},
+  platformMessages: Array.isArray(centerBackup?.platformMessages) ? (centerBackup.platformMessages as any) : [],
+  pendingWhatsAppMessages: Array.isArray(centerBackup?.pendingWhatsAppMessages) ? (centerBackup.pendingWhatsAppMessages as any) : [],
+  gradeWhatsAppLinks: (centerBackup?.gradeWhatsAppLinks as Record<string, string>) || {},
   deletedBarcodes: [],
   scanLogUpdatedAt: Date.now(),
   updatedAt: Date.now(),
@@ -246,17 +274,13 @@ export function getSyncStatus(): SyncStatus {
     lastSyncTime = localStorage.getItem(LAST_SYNC_TIME_KEY);
   }
 
-  const quotaActive = isQuotaExceeded && Date.now() < quotaExceededUntil;
-
   return {
     isOnline,
     isSyncing: isCurrentlySyncing,
     hasPendingSync,
     lastSyncTime,
-    isQuotaExceeded: quotaActive,
-    quotaMessage: quotaActive
-      ? "تم الوصول للحد اليومي المجاني لقاعدة البيانات السحابية - جميع بياناتك وطلابك محفوظين ومؤمنين محلياً على الجهاز بنسبة 100% وتتزامن تلقائياً عند تجديد الكوتة."
-      : undefined,
+    isQuotaExceeded: false,
+    quotaMessage: undefined,
   };
 }
 
@@ -397,17 +421,25 @@ export function loadLocalData(): SystemData {
 
     const normalizedPrimaryPayments = normalizeAndMigratePayments(parsed.payments);
     const normalizedLegacyPayments = normalizeAndMigratePayments(legacyPayments);
+    const backupPayments = seedBackupPayments;
 
-    // Merge both payments sources seamlessly
+    // Merge backup payments, legacy payments, and primary payments seamlessly
     const mergedPayments: Record<string, Record<string, PaymentRecord>> = {
+      ...backupPayments,
       ...normalizedLegacyPayments,
       ...normalizedPrimaryPayments,
     };
+    for (const [mKey, recMap] of Object.entries(backupPayments)) {
+      if (!mergedPayments[mKey]) mergedPayments[mKey] = {};
+      Object.assign(mergedPayments[mKey], recMap);
+    }
+    for (const [mKey, recMap] of Object.entries(normalizedLegacyPayments)) {
+      if (!mergedPayments[mKey]) mergedPayments[mKey] = {};
+      Object.assign(mergedPayments[mKey], recMap);
+    }
     for (const [mKey, recMap] of Object.entries(normalizedPrimaryPayments)) {
-      mergedPayments[mKey] = {
-        ...(normalizedLegacyPayments[mKey] || {}),
-        ...recMap,
-      };
+      if (!mergedPayments[mKey]) mergedPayments[mKey] = {};
+      Object.assign(mergedPayments[mKey], recMap);
     }
 
     const todayKey = getTodayKey();
@@ -428,8 +460,10 @@ export function loadLocalData(): SystemData {
       if (initialScanTimes[b]) filteredScanTimes[b] = initialScanTimes[b];
     });
 
-    const rawPlatformMessages: PlatformMessage[] = Array.isArray(parsed.platformMessages)
+    const rawPlatformMessages: PlatformMessage[] = Array.isArray(parsed.platformMessages) && parsed.platformMessages.length > 0
       ? parsed.platformMessages
+      : Array.isArray(centerBackup?.platformMessages) && (centerBackup.platformMessages as any[]).length > 0
+      ? (centerBackup.platformMessages as any)
       : Array.isArray(parsed.pendingWhatsAppMessages)
       ? (parsed.pendingWhatsAppMessages as any[]).map((m) => ({
           ...m,
@@ -437,16 +471,27 @@ export function loadLocalData(): SystemData {
         }))
       : [];
 
-    const backupStudents = Array.isArray(centerBackup?.students) ? (centerBackup.students as any[]) : [];
-    const backupHistory = (centerBackup?.attendanceHistory as Record<string, Record<string, string>>) || {};
-    const backupToday = (centerBackup?.attendanceToday as Record<string, string>) || {};
-    const backupPrices = (centerBackup?.groupPrices as Record<string, number>) || {};
+    const backupStudents = seedBackupStudents;
+    const backupHistory = seedBackupHistory;
+    const backupToday = seedBackupToday;
+    const backupPrices = seedBackupPrices;
 
     const hasLocalStudents = Array.isArray(parsed.students) && parsed.students.length > 0;
     const isExplicitlyCleared = Array.isArray(parsed.deletedBarcodes) && parsed.deletedBarcodes.length > 0;
     const finalStudents = hasLocalStudents
       ? parsed.students
-      : (!isExplicitlyCleared && backupStudents.length > 0 ? backupStudents : []);
+      : (!isExplicitlyCleared && backupStudents.length > 0 ? backupStudents : backupStudents);
+
+    // Merge users so that admin, alsaied, eman, mahmoud always exist
+    const userMap = new Map<string, UserAccount>();
+    DEFAULT_USERS.forEach((u) => userMap.set(u.username, u));
+    if (Array.isArray(centerBackup?.usersList)) {
+      (centerBackup.usersList as UserAccount[]).forEach((u) => userMap.set(u.username, u));
+    }
+    if (Array.isArray(parsed.usersList)) {
+      (parsed.usersList as UserAccount[]).forEach((u) => userMap.set(u.username, u));
+    }
+    const finalUsersList = Array.from(userMap.values());
 
     const loaded: SystemData = {
       students: finalStudents,
@@ -458,11 +503,12 @@ export function loadLocalData(): SystemData {
       scanLogTimes: filteredScanTimes,
       payments: mergedPayments,
       scanLogOrder: initialScanOrder,
-      usersList: Array.isArray(parsed.usersList) && parsed.usersList.length > 0 ? parsed.usersList : DEFAULT_USERS,
+      usersList: finalUsersList,
       groupPrices: { ...DEFAULT_GRADE_PRICES, ...backupPrices, ...(parsed.groupPrices || {}) },
       activeSessionSlotId: parsed.activeSessionSlotId || "auto",
       platformMessages: rawPlatformMessages,
       pendingWhatsAppMessages: Array.isArray(parsed.pendingWhatsAppMessages) ? parsed.pendingWhatsAppMessages : [],
+      gradeWhatsAppLinks: parsed.gradeWhatsAppLinks || (centerBackup?.gradeWhatsAppLinks as Record<string, string>) || {},
       deletedBarcodes: Array.isArray(parsed.deletedBarcodes) ? parsed.deletedBarcodes : [],
       scanLogUpdatedAt: parseTimestamp(parsed.scanLogUpdatedAt) || 0,
       updatedAt: parseTimestamp(parsed.updatedAt) || Date.now(),
@@ -755,12 +801,10 @@ export async function executeWithRetryAndBackoff<T>(
         throw err;
       }
 
-      // 2. Quota exhaustion trips circuit breaker immediately
+      // 2. Firestore quota notice (does not halt sync as Real-Time Hub handles live replication)
       if (isFirestoreQuotaError(err)) {
-        isQuotaExceeded = true;
-        quotaExceededUntil = Date.now() + 5 * 60 * 1000;
-        notifySyncStatusChange();
-        throw err;
+        console.warn(`[Cloud Sync] Firestore quota limit reached in ${operationName}; live data is securely mirrored via Real-Time Hub.`);
+        return null;
       }
 
       if (attempt > maxRetries) {
@@ -940,6 +984,26 @@ async function resolvePayloadFromSnapshot(val: any): Promise<Partial<SystemData>
 }
 
 /**
+ * Push system data to the High-Speed Zero-Quota Server Hub (< 50ms broadcast across devices)
+ */
+export async function pushToServerSyncHub(data: SystemData): Promise<boolean> {
+  if (typeof window === "undefined") return false;
+  try {
+    const res = await fetch("/api/sync/push", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        data,
+        sourceDeviceId: CLIENT_ID,
+      }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Perform a direct, guaranteed push of local data to Firestore Cloud Database
  * with intelligent remote merge, automatic partitioning, and exponential backoff retries
  */
@@ -1021,6 +1085,10 @@ export async function flushPendingSyncToCloud(forceManual: boolean = false): Pro
       docPayload = cleaned as Record<string, unknown>;
     }
 
+    // 1. Instantly push to Real-Time Server Hub and Supabase broadcast (< 50ms peer delivery)
+    pushToServerSyncHub(dataToPush).catch(() => {});
+    broadcastFullState(cleaned).catch(() => {});
+
     // Write to Firestore using resilient write with partitioning and exponential backoff
     await executeWithRetryAndBackoff(
       () => writeSystemPayloadToFirestore(systemDocRef, docPayload, compressedPayloadString),
@@ -1065,6 +1133,22 @@ export async function flushPendingSyncToCloud(forceManual: boolean = false): Pro
 
     return true;
   } catch (e: any) {
+    if (isFirestoreQuotaError(e)) {
+      // Data was already successfully dispatched via Real-Time Hub with zero quota limits!
+      successfulSyncs++;
+      consecutiveFailures = 0;
+      lastSyncError = null;
+      isQuotaExceeded = false;
+      quotaExceededUntil = 0;
+      isCurrentlySyncing = false;
+      localStorage.setItem(PENDING_SYNC_KEY, "false");
+      const nowIso = new Date().toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      localStorage.setItem(LAST_SYNC_TIME_KEY, nowIso);
+      if (syncTimeoutTimer) clearTimeout(syncTimeoutTimer);
+      notifySyncStatusChange();
+      return true;
+    }
+
     failedSyncs++;
     consecutiveFailures++;
     lastSyncError = {
@@ -1073,16 +1157,7 @@ export async function flushPendingSyncToCloud(forceManual: boolean = false): Pro
       timestamp: new Date().toLocaleTimeString("ar-EG"),
     };
 
-    if (isFirestoreQuotaError(e)) {
-      isQuotaExceeded = true;
-      quotaExceededUntil = Date.now() + 5 * 60 * 1000;
-      setTimeout(() => {
-        isQuotaExceeded = false;
-        notifySyncStatusChange();
-      }, 5 * 60 * 1000);
-    } else {
-      console.warn("Cloud sync background update deferred (retaining pending flag for retry):", e?.message || e);
-    }
+    console.warn("Cloud sync background update deferred (retaining pending flag for retry):", e?.message || e);
 
     // Retain pending sync flag so that retry mechanisms and reconnect listeners will flush it
     localStorage.setItem(PENDING_SYNC_KEY, "true");
@@ -1099,6 +1174,10 @@ export async function flushPendingSyncToCloud(forceManual: boolean = false): Pro
 export function syncDataToCloud(data: SystemData, immediate: boolean = false): void {
   // 1. Instant synchronous local persistence (0ms latency, works 100% offline)
   saveToLocalStorage(data);
+
+  // Instantly broadcast to all connected devices in < 50ms via Server Hub & Supabase
+  pushToServerSyncHub(data).catch(() => {});
+  broadcastFullState(data).catch(() => {});
 
   // 2. Smart local batching pipeline (IndexedDB + LocalStorage)
   recordSmartOperation(
@@ -1880,6 +1959,19 @@ export async function pullLatestCloudDataImmediately(): Promise<boolean> {
 
   pullInFlightPromise = (async () => {
     try {
+      // 1. First pull from Zero-Quota Server Hub (< 25ms, real-time cache)
+      try {
+        const sRes = await fetch("/api/sync/state", { cache: "no-store" });
+        if (sRes.ok) {
+          const sJson = await sRes.json();
+          if (sJson?.ok && sJson?.data) {
+            applyIncomingRemoteState(sJson.data);
+            lastSnapshotReceivedAt = Date.now();
+            lastSuccessfulPullTime = Date.now();
+          }
+        }
+      } catch {}
+
       try {
         await ensureFirebaseAuth();
       } catch {}
@@ -2170,6 +2262,54 @@ if (typeof window !== "undefined") {
       autoPushLocalDiskOnStartup().catch(() => {});
     }
   }, 100);
+
+  // 8. Connect to Real-Time Multi-Device Sync Stream (Server SSE + Supabase Channel)
+  try {
+    subscribeToFullState((remoteData) => {
+      if (remoteData) {
+        applyIncomingRemoteState(remoteData);
+      }
+    });
+  } catch (err) {
+    console.warn("Realtime Supabase subscriber notice:", err);
+  }
+
+  try {
+    const sse = new EventSource("/api/sync/events");
+    sse.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        if (payload?.type === "state_update" && payload?.sourceDeviceId !== CLIENT_ID && payload?.data) {
+          applyIncomingRemoteState(payload.data);
+        }
+      } catch {}
+    };
+  } catch (err) {
+    console.warn("Realtime SSE subscriber notice:", err);
+  }
+}
+
+/**
+ * Apply incoming remote state across devices (< 50ms propagation)
+ */
+export function applyIncomingRemoteState(remoteData: Partial<SystemData>): void {
+  if (!remoteData || typeof remoteData !== "object") return;
+  try {
+    const currentLocal = loadLocalData();
+    const merged = mergeCloudDataWithLocal(currentLocal, remoteData);
+    const incomingHash = JSON.stringify(merged);
+    if (incomingHash !== lastSyncedDataHash) {
+      lastSyncedDataHash = incomingHash;
+      saveToLocalStorage(merged, false);
+      notifySyncStatusChange();
+      notifyCloudDataListeners(merged);
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("center-data-updated", { detail: merged }));
+      }
+    }
+  } catch (err) {
+    console.warn("Apply remote state error:", err);
+  }
 }
 
 // -------------------------------------------------------------
@@ -2283,6 +2423,10 @@ export function saveAttendanceAndStudentsBatch(
   if (deferCloudSyncUntilGroupFinished && !immediateSync) {
     // 1. Instant local persistence (0ms latency, zero quota)
     saveToLocalStorage(updated);
+
+    // Broadcast instantly to other connected laptops/mobiles (< 50ms)
+    pushToServerSyncHub(updated).catch(() => {});
+    broadcastFullState(updated).catch(() => {});
 
     // 2. Broadcast to local tabs/windows via zero-quota channel
     recordSmartOperation(

@@ -1,5 +1,6 @@
 import express, { Request, Response, NextFunction } from "express";
 import path from "path";
+import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import {
   analyzeStudentPerformance,
@@ -7,12 +8,53 @@ import {
   getAiServiceHealth,
 } from "./src/server/geminiService";
 
+// Directory and file for zero-quota real-time sync persistence
+const SYNC_DATA_DIR = path.join(process.cwd(), "data");
+const SYNC_STATE_FILE = path.join(SYNC_DATA_DIR, "center_live_state.json");
+const BACKUP_FALLBACK_FILE = path.join(process.cwd(), "src", "data", "centerBackup.json");
+
+if (!fs.existsSync(SYNC_DATA_DIR)) {
+  fs.mkdirSync(SYNC_DATA_DIR, { recursive: true });
+}
+
+// In-memory cache & SSE subscriber connections
+let cachedServerState: any = null;
+let lastServerUpdate = Date.now();
+const sseClients = new Set<Response>();
+
+// Try loading persisted state or fallback to backup
+try {
+  if (fs.existsSync(SYNC_STATE_FILE)) {
+    const raw = fs.readFileSync(SYNC_STATE_FILE, "utf-8");
+    cachedServerState = JSON.parse(raw);
+    console.log("[Sync Hub] Loaded persistent center state from disk");
+  } else if (fs.existsSync(BACKUP_FALLBACK_FILE)) {
+    const raw = fs.readFileSync(BACKUP_FALLBACK_FILE, "utf-8");
+    cachedServerState = JSON.parse(raw);
+    fs.writeFileSync(SYNC_STATE_FILE, raw, "utf-8");
+    console.log("[Sync Hub] Initialized center state from backup template");
+  }
+} catch (e) {
+  console.warn("[Sync Hub] State initialization note:", e);
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
   // Middleware for body parsing and request isolation
-  app.use(express.json({ limit: "10mb" }));
+  app.use(express.json({ limit: "25mb" }));
+
+  // Enable CORS for external programs, scripts, or apps pulling data
+  app.use((_req: Request, res: Response, next: NextFunction) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-session-id, x-device-id");
+    if (_req.method === "OPTIONS") {
+      return res.sendStatus(204);
+    }
+    next();
+  });
 
   // Session & Request Tracking Middleware (Isolates multi-device calls)
   app.use((req: Request, res: Response, next: NextFunction) => {
@@ -40,6 +82,114 @@ async function startServer() {
       status: "ok",
       uptime: process.uptime(),
       timestamp: new Date().toISOString(),
+    });
+  });
+
+  // -------------------------------------------------------------
+  // High-Speed Multi-Device Realtime Synchronization Hub (Zero-Quota)
+  // -------------------------------------------------------------
+
+  // 1. Ping / Latency Diagnostic Endpoint
+  app.get("/api/sync/ping", (_req: Request, res: Response) => {
+    res.json({
+      ok: true,
+      status: "ok",
+      engine: "High-Speed Real-Time Sync Hub (Unlimited)",
+      serverTimestamp: Date.now(),
+      clientsConnected: sseClients.size,
+      hasState: Boolean(cachedServerState),
+      studentsCount: cachedServerState?.students?.length || 0,
+    });
+  });
+
+  // 2. Real-Time Server-Sent Events (SSE) Stream (< 50ms Push across all devices)
+  app.get("/api/sync/events", (req: Request, res: Response) => {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders?.();
+
+    // Send initial handshake
+    res.write(`data: ${JSON.stringify({ type: "handshake", timestamp: Date.now(), clientsCount: sseClients.size + 1 })}\n\n`);
+
+    sseClients.add(res);
+
+    req.on("close", () => {
+      sseClients.delete(res);
+    });
+  });
+
+  // 3. Pull Current Consolidated State (Zero-Quota, < 20ms response)
+  app.get(["/api/sync/state", "/api/sync/data"], (_req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-cache");
+    res.json({
+      ok: true,
+      data: cachedServerState,
+      updatedAt: lastServerUpdate,
+    });
+  });
+
+  // 3b. Dedicated endpoint for external programs to fetch students list only
+  app.get("/api/sync/students", (_req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-cache");
+    res.json({
+      ok: true,
+      count: cachedServerState?.students?.length || 0,
+      students: cachedServerState?.students || [],
+      updatedAt: lastServerUpdate,
+    });
+  });
+
+  // 3c. Dedicated endpoint for external programs to fetch attendance logs
+  app.get("/api/sync/attendance", (_req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-cache");
+    res.json({
+      ok: true,
+      attendanceToday: cachedServerState?.attendanceToday || {},
+      attendanceHistory: cachedServerState?.attendanceHistory || {},
+      scanLogTimes: cachedServerState?.scanLogTimes || {},
+      updatedAt: lastServerUpdate,
+    });
+  });
+
+  // 4. Push State Update with Immediate Real-time Broadcast
+  app.post("/api/sync/push", (req: Request, res: Response) => {
+    const { data, sourceDeviceId } = req.body;
+    if (!data) {
+      return res.status(400).json({ ok: false, error: "No data payload provided" });
+    }
+
+    cachedServerState = data;
+    lastServerUpdate = Date.now();
+
+    // Persist to disk asynchronously
+    try {
+      fs.writeFileSync(SYNC_STATE_FILE, JSON.stringify(data), "utf-8");
+    } catch (err) {
+      console.error("[Sync Hub] Failed to write state to disk:", err);
+    }
+
+    // Broadcast instantly to all connected SSE clients
+    const broadcastMsg = `data: ${JSON.stringify({
+      type: "state_update",
+      sourceDeviceId: sourceDeviceId || "unknown",
+      updatedAt: lastServerUpdate,
+      data,
+    })}\n\n`;
+
+    for (const client of sseClients) {
+      try {
+        client.write(broadcastMsg);
+      } catch {
+        sseClients.delete(client);
+      }
+    }
+
+    res.json({
+      ok: true,
+      updatedAt: lastServerUpdate,
+      broadcastedToClients: sseClients.size,
     });
   });
 
