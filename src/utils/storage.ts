@@ -460,22 +460,12 @@ export function loadLocalData(): SystemData {
     }
 
     const todayKey = getTodayKey();
-    let initialScanOrder: string[] = Array.isArray(parsed.scanLogOrder) ? parsed.scanLogOrder : [];
-    let initialScanTimes: Record<string, string> = parsed.scanLogTimes || {};
+    const initialScanOrder: string[] = Array.isArray(parsed.scanLogOrder) ? parsed.scanLogOrder : [];
+    const initialScanTimes: Record<string, string> = parsed.scanLogTimes || {};
 
-    // Filter out scans that are from previous days so scanner always opens fresh for today
-    initialScanOrder = initialScanOrder.filter((b: string) => {
-      const timeIso = initialScanTimes[b];
-      if (typeof timeIso === "string" && timeIso.includes("T")) {
-        return timeIso.startsWith(todayKey);
-      }
-      return true;
-    });
-
-    const filteredScanTimes: Record<string, string> = {};
-    initialScanOrder.forEach((b: string) => {
-      if (initialScanTimes[b]) filteredScanTimes[b] = initialScanTimes[b];
-    });
+    // 🔒 Scanner Persistence Guarantee: Scans are NEVER auto-deleted on refresh or reload!
+    // Scans are ONLY cleared when the user explicitly confirms "حفظ وإرسال الغياب للكل"
+    const filteredScanTimes: Record<string, string> = { ...initialScanTimes };
 
     const rawPlatformMessages: PlatformMessage[] = Array.isArray(parsed.platformMessages) && parsed.platformMessages.length > 0
       ? parsed.platformMessages
@@ -1015,6 +1005,23 @@ export async function pushToServerSyncHub(data: SystemData): Promise<boolean> {
   }
 }
 
+let pushHubDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+let lastQueuedSyncHubData: SystemData | null = null;
+
+export function pushToServerSyncHubDebounced(data: SystemData, delayMs = 300): void {
+  lastQueuedSyncHubData = data;
+  if (pushHubDebounceTimer) {
+    clearTimeout(pushHubDebounceTimer);
+  }
+  pushHubDebounceTimer = setTimeout(() => {
+    pushHubDebounceTimer = null;
+    if (lastQueuedSyncHubData) {
+      pushToServerSyncHub(lastQueuedSyncHubData).catch(() => {});
+      broadcastFullState(lastQueuedSyncHubData).catch(() => {});
+    }
+  }, delayMs);
+}
+
 /**
  * Perform a direct, guaranteed push of local data to Firestore Cloud Database
  * with intelligent remote merge, automatic partitioning, and exponential backoff retries
@@ -1416,23 +1423,18 @@ export function mergeCloudDataWithLocal(local: SystemData, cloud: Partial<System
       }
     });
 
-    // Filter scans for today
-    const todayScans = Array.from(allScannedBarcodes).filter((barcode) => {
-      const timeIso = combinedScanTimes[barcode];
-      if (typeof timeIso === "string" && timeIso.includes("T")) {
-        return timeIso.startsWith(todayKey);
-      }
-      return true;
-    });
+    // 🔒 Retain all active scans: Never drop scanned students on remote merge!
+    // They are only removed when the group attendance is finalized ("حفظ وإرسال الغياب للكل")
+    const activeScans = Array.from(allScannedBarcodes);
 
     // Sort descending by scan time (latest scanned student at index 0)
-    todayScans.sort((a, b) => {
+    activeScans.sort((a, b) => {
       const timeA = combinedScanTimes[a] ? new Date(combinedScanTimes[a]).getTime() : 0;
       const timeB = combinedScanTimes[b] ? new Date(combinedScanTimes[b]).getTime() : 0;
       return timeB - timeA;
     });
 
-    const mergedOrder = todayScans;
+    const mergedOrder = activeScans;
 
     const mergedScanTimes: Record<string, string> = {};
     mergedOrder.forEach((barcode) => {
@@ -2536,12 +2538,11 @@ export function saveAttendanceAndStudentsBatch(
   };
 
   if (deferCloudSyncUntilGroupFinished && !immediateSync) {
-    // 1. Instant local persistence (0ms latency, zero quota)
+    // 1. Instant local persistence (0ms latency, zero quota, crash proof)
     saveToLocalStorage(updated);
 
-    // Broadcast instantly to other connected laptops/mobiles (< 50ms)
-    pushToServerSyncHub(updated).catch(() => {});
-    broadcastFullState(updated).catch(() => {});
+    // Broadcast smoothly to other connected devices (< 300ms debounce during 100 students burst)
+    pushToServerSyncHubDebounced(updated, 300);
 
     // 2. Broadcast to local tabs/windows via zero-quota channel
     recordSmartOperation(

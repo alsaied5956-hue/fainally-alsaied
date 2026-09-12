@@ -220,6 +220,13 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
   onRecordAttendanceRef.current = onRecordAttendance;
   const processedScansSet = useRef(new Set<string>());
 
+  // High-throughput deduplication and atomic presence guards (100 students / 3 min capacity)
+  const localScannedBarcodesSetRef = useRef(new Set<string>());
+  useEffect(() => {
+    localScannedBarcodesSetRef.current = new Set((scanLogOrder || []).map((b) => String(b).trim()));
+  }, [scanLogOrder]);
+  const recentScanCodesDebounceRef = useRef<{ [code: string]: number }>({});
+
   // ⚡ Diagnostic Ping Test: Test Realtime Connection and Latency Across All Devices
   const runMultiDevicePingTest = () => {
     setIsPingingDevices(true);
@@ -349,10 +356,12 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
       return;
     }
 
-    // 2. Prevent duplicate scan if student is already in the classroom presence list
-    const alreadyScanned = (scanLogOrder || []).some(
-      (b) => String(b).trim() === String(student.barcode).trim()
-    );
+    const cleanBarcode = String(student.barcode).trim();
+    // 2. Prevent duplicate scan if student is already in the classroom presence list (Atomic Synchronous Guard)
+    const alreadyScanned =
+      localScannedBarcodesSetRef.current.has(cleanBarcode) ||
+      (scanLogOrder || []).some((b) => String(b).trim() === cleanBarcode);
+
     if (alreadyScanned && !overrideStatus) {
       const existingIso = scanLogTimes?.[student.barcode];
       const existingTimeStr = existingIso
@@ -370,6 +379,9 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
       });
       return;
     }
+
+    // Mark immediately in synchronous in-memory set to prevent race conditions during rapid multi-student scans
+    localScannedBarcodesSetRef.current.add(cleanBarcode);
 
     // 3. Record student at entry time & evaluate whether on-time (حضور) or late (تأخير)
     const now = new Date();
@@ -438,6 +450,14 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     const clean = normalizeBarcode(rawCode);
     if (!clean) return;
 
+    // Optical hardware bounce debounce: reject burst duplicates of same barcode within 750ms
+    const nowMs = Date.now();
+    const lastTime = recentScanCodesDebounceRef.current[clean];
+    if (lastTime && nowMs - lastTime < 750) {
+      return;
+    }
+    recentScanCodesDebounceRef.current[clean] = nowMs;
+
     const matchResult = findStudentByScannedCode(clean, students, studentMap);
 
     if (!matchResult) {
@@ -501,6 +521,10 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
 
       // Enter key indicates end of barcode scan
       if (e.key === "Enter") {
+        if (target === inputRef.current) {
+          // Handled natively by form onSubmit to prevent duplicate execution
+          return;
+        }
         if (keyBuffer.trim().length >= 2) {
           e.preventDefault();
           const scanned = keyBuffer;

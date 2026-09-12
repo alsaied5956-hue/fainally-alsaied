@@ -514,12 +514,10 @@ async function startServer() {
       }
     });
 
-    const todayBarcodes = Array.from(allScanned).filter((b) => {
-      const t = mergedScanTimes[b];
-      return typeof t === "string" && t.includes("T") ? t.startsWith(todayKey) : true;
-    });
+    // 🔒 Preserve all scanned barcodes! Never delete or drop barcodes due to UTC/local date discrepancies!
+    const activeBarcodes = Array.from(allScanned);
 
-    todayBarcodes.sort((a, b) => {
+    activeBarcodes.sort((a, b) => {
       const timeA = mergedScanTimes[a] ? new Date(mergedScanTimes[a]).getTime() : 0;
       const timeB = mergedScanTimes[b] ? new Date(mergedScanTimes[b]).getTime() : 0;
       return timeB - timeA;
@@ -539,12 +537,45 @@ async function startServer() {
       students: Array.from(studentMap.values()),
       attendanceToday: mergedAttendanceToday,
       attendanceHistory: mergedAttendanceHistory,
-      scanLogOrder: todayBarcodes,
+      scanLogOrder: activeBarcodes,
       scanLogTimes: mergedScanTimes,
       payments: mergedPayments,
       deletedBarcodes: Array.from(deletedSet),
       updatedAt: Math.max(existing.updatedAt || 0, incoming.updatedAt || 0, Date.now()),
     };
+  }
+
+  // Server Firestore mirror debounce timer for high-volume rapid scanning
+  let serverFirestoreDebounceTimer: NodeJS.Timeout | null = null;
+  function scheduleServerFirestoreMirror(data: any, updateTime: number, devId: string) {
+    if (!serverFirestoreDb) return;
+    if (serverFirestoreDebounceTimer) {
+      clearTimeout(serverFirestoreDebounceTimer);
+    }
+    serverFirestoreDebounceTimer = setTimeout(async () => {
+      serverFirestoreDebounceTimer = null;
+      try {
+        const compressedPayload = compressCloudPayload(data);
+        const docRef = doc(serverFirestoreDb, "system_state", "main_center_data");
+        await setDoc(
+          docRef,
+          {
+            _compressedPayload: compressedPayload,
+            studentsCount: Array.isArray(data.students) ? data.students.length : 0,
+            paymentsCount: Object.values(data.payments || {}).reduce(
+              (acc: number, m: any) => acc + Object.keys(m || {}).length,
+              0
+            ),
+            updatedAt: updateTime,
+            _lastClientId: devId || "server_sync_hub",
+            syncedAtIso: new Date().toISOString(),
+          },
+          { merge: true }
+        );
+      } catch (e: any) {
+        console.warn("[Sync Hub] Background Firestore write warning:", e?.message);
+      }
+    }, 2000);
   }
 
   // 4. Push Unified State Update with Immediate Real-time Broadcast
@@ -558,12 +589,10 @@ async function startServer() {
     cachedServerState = mergedData;
     lastServerUpdate = Date.now();
 
-    // Persist to disk asynchronously
-    try {
-      fs.writeFileSync(SYNC_STATE_FILE, JSON.stringify(mergedData), "utf-8");
-    } catch (err) {
+    // Persist to disk asynchronously without blocking the event loop
+    fs.promises.writeFile(SYNC_STATE_FILE, JSON.stringify(mergedData), "utf-8").catch((err) => {
       console.error("[Sync Hub] Failed to write unified state to disk:", err);
-    }
+    });
 
     // Broadcast instantly to all unified screens
     broadcastToUnified({
@@ -573,30 +602,8 @@ async function startServer() {
       data: mergedData,
     });
 
-    // Mirror asynchronously to Cloud Firestore so all external platforms stay 100% unified
-    if (serverFirestoreDb) {
-      try {
-        const compressedPayload = compressCloudPayload(mergedData);
-        const docRef = doc(serverFirestoreDb, "system_state", "main_center_data");
-        setDoc(
-          docRef,
-          {
-            _compressedPayload: compressedPayload,
-            studentsCount: Array.isArray(mergedData.students) ? mergedData.students.length : 0,
-            paymentsCount: Object.values(mergedData.payments || {}).reduce(
-              (acc: number, m: any) => acc + Object.keys(m || {}).length,
-              0
-            ),
-            updatedAt: lastServerUpdate,
-            _lastClientId: sourceDeviceId || "server_sync_hub",
-            syncedAtIso: new Date().toISOString(),
-          },
-          { merge: true }
-        ).catch((e) => console.warn("[Sync Hub] Background Firestore write warning:", e?.message));
-      } catch (e: any) {
-        console.warn("[Sync Hub] Firestore mirror compression note:", e?.message);
-      }
-    }
+    // Mirror asynchronously to Cloud Firestore with debouncing
+    scheduleServerFirestoreMirror(mergedData, lastServerUpdate, sourceDeviceId || "unknown");
 
     res.json({
       ok: true,
