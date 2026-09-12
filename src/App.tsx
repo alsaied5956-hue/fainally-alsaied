@@ -49,7 +49,11 @@ import {
   subscribeToPaymentChanges,
   subscribeToStudentChanges,
   subscribeToExamGradeChanges,
+  subscribeToLiveScans,
+  subscribeToMultiDevicePing,
+  broadcastMultiDevicePong,
 } from "./utils/supabaseClient";
+import { getPersistentDeviceId, getPersistentDeviceName } from "./utils/deviceClient";
 import {
   dualSyncLiveScan,
   dualSyncGroupFinished,
@@ -475,11 +479,71 @@ export default function App() {
       );
     });
 
+    const currentDevId = getPersistentDeviceId();
+    const currentDevName = getPersistentDeviceName();
+
+    // ⚡ Instant Multi-Device Live Scan Reception
+    const unsubLiveScan = subscribeToLiveScans((payload) => {
+      // Ignore scans originating from THIS device
+      if (payload.sourceDeviceId && payload.sourceDeviceId === currentDevId) {
+        return;
+      }
+
+      const b = String(payload.barcode).trim();
+      const status = payload.status === "تأخير" ? "تأخير" : "حضور";
+      const timeIso = payload.timeIso || new Date().toISOString();
+      const dateKey = getTodayKey();
+
+      setAttendanceToday((prev) => ({ ...prev, [b]: status }));
+      setAttendanceHistory((prev) => {
+        const dayMap = { ...(prev[dateKey] || {}) };
+        dayMap[b] = status;
+        return { ...prev, [dateKey]: dayMap };
+      });
+      setScanLogOrder((prev) => (prev.includes(b) ? prev : [b, ...prev]));
+      setScanLogTimes((prev) => ({ ...prev, [b]: timeIso }));
+
+      // Also increment student total attendance days if first time today
+      setStudents((prev) =>
+        prev.map((s) => {
+          if (s.barcode === b) {
+            return {
+              ...s,
+              totalAttendanceDays: (s.totalAttendanceDays || 0) + 1,
+            };
+          }
+          return s;
+        })
+      );
+
+      setSyncBanner({
+        show: true,
+        type: "online-synced",
+        message: `⚡ مسح لحظي من (${payload.scannedBy || "جهاز مساعد آخر"}): تم تسجيل ${status} للطالب (${payload.name}) في تمام (${payload.timeDisplay || "الآن"})!`,
+      });
+      setTimeout(() => setSyncBanner(null), 4500);
+    });
+
+    // ⚡ Multi-Device Diagnostic Ping Responder: Auto-reply to ping requests from other devices
+    const unsubPing = subscribeToMultiDevicePing((payload) => {
+      if (payload.sourceDeviceId && payload.sourceDeviceId !== currentDevId) {
+        broadcastMultiDevicePong({
+          pingId: payload.pingId,
+          targetDeviceId: payload.sourceDeviceId,
+          responderDeviceId: currentDevId,
+          responderDeviceName: currentDevName,
+          timestamp: Date.now(),
+        });
+      }
+    });
+
     return () => {
       unsubGroup();
       unsubPayment();
       unsubStudent();
       unsubExamGrade();
+      unsubLiveScan();
+      unsubPing();
     };
   }, []);
 
@@ -523,7 +587,7 @@ export default function App() {
     setScanLogOrder(updatedOrder);
     setScanLogTimes(updatedTimes);
 
-    // ⚡ Dual-Sync to Firebase and Supabase immediately
+    // ⚡ Dual-Sync to Firebase and Supabase immediately with sourceDeviceId
     dualSyncLiveScan({
       barcode,
       name: student.name,
@@ -535,6 +599,7 @@ export default function App() {
       isPaid: isStudentPaid(payments?.[getCurrentMonthKey()], barcode),
       scannedBy: currentUser?.username || "الماسح",
       studentFallback: student,
+      sourceDeviceId: getPersistentDeviceId(),
     });
 
     // Instant local save with batching

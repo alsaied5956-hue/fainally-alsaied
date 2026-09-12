@@ -37,7 +37,7 @@ import {
   getTodayDateKey,
 } from "./supabaseClient";
 import { pushLiveAttendanceEvent, pushLiveAttendanceBatch } from "./liveEventStream";
-import { recordDeviceEntryExitScan } from "./deviceClient";
+import { recordDeviceEntryExitScan, getPersistentDeviceId } from "./deviceClient";
 import { Student } from "../types";
 import {
   emitParentNotification,
@@ -68,6 +68,7 @@ export interface ScanSyncParams {
   isPaid?: boolean;
   scannedBy?: string;
   studentFallback?: Partial<Student>;
+  sourceDeviceId?: string;
 }
 
 export function dualSyncLiveScan(params: ScanSyncParams) {
@@ -95,6 +96,7 @@ export function dualSyncLiveScan(params: ScanSyncParams) {
       isPaid: !!params.isPaid,
       scannedBy: params.scannedBy || "الماسح",
       timestamp: Date.now(),
+      sourceDeviceId: params.sourceDeviceId || getPersistentDeviceId(),
     }),
     "Supabase broadcastLiveScan"
   );

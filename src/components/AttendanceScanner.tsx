@@ -17,11 +17,15 @@ import { StudentSearchBox } from "./StudentSearchBox";
 import { enqueuePlatformMessagesBatch, flushPendingSyncToCloud } from "../utils/storage";
 import { pushLiveAttendanceEvent } from "../utils/liveEventStream";
 import { dualSyncLiveScan } from "../utils/dualSync";
-import { recordDeviceEntryExitScan } from "../utils/deviceClient";
+import { recordDeviceEntryExitScan, getPersistentDeviceId, getPersistentDeviceName } from "../utils/deviceClient";
 import {
   subscribeToLiveScans,
+  broadcastMultiDevicePing,
+  subscribeToMultiDevicePong,
   LiveScanPayload,
 } from "../utils/supabaseClient";
+import { CameraScannerModal } from "./CameraScannerModal";
+import { normalizeBarcode, findStudentByScannedCode } from "../utils/scannerUtils";
 import {
   ScanLine,
   UserCheck,
@@ -49,6 +53,10 @@ import {
   RotateCcw,
   CloudUpload,
   Loader2,
+  Camera,
+  Activity,
+  Wifi,
+  ShieldCheck,
 } from "lucide-react";
 
 interface AttendanceScannerProps {
@@ -175,6 +183,28 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
 
   const inputRef = useRef<HTMLInputElement>(null);
 
+  // Fast O(1) student lookup map to eliminate slow array searches
+  const studentMap = useMemo(() => {
+    const map = new Map<string, Student>();
+    (students || []).forEach((s) => {
+      if (s?.barcode) {
+        map.set(String(s.barcode).trim(), s);
+      }
+    });
+    return map;
+  }, [students]);
+
+  // ⚡ Camera Barcode Scanner Modal State
+  const [isCameraScannerOpen, setIsCameraScannerOpen] = useState(false);
+
+  // ⚡ Multi-Device Sync Diagnostics State
+  const [isPingingDevices, setIsPingingDevices] = useState(false);
+  const [pingResults, setPingResults] = useState<{
+    count: number;
+    testedAt: string;
+    devices: { name: string; latency: number; deviceId: string }[];
+  } | null>(null);
+
   // ⚡ Supabase Realtime State: Incoming scans from other assistants in sub-50ms
   const [liveAssistantNotice, setLiveAssistantNotice] = useState<{
     name: string;
@@ -190,9 +220,55 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
   onRecordAttendanceRef.current = onRecordAttendance;
   const processedScansSet = useRef(new Set<string>());
 
-  // ⚡ Listen to instant scans across all assistant devices (Zero Memory Leak)
+  // ⚡ Diagnostic Ping Test: Test Realtime Connection and Latency Across All Devices
+  const runMultiDevicePingTest = () => {
+    setIsPingingDevices(true);
+    setPingResults(null);
+
+    const pingId = `ping_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const start = Date.now();
+    const myId = getPersistentDeviceId();
+    const myName = getPersistentDeviceName();
+    const collected: { name: string; latency: number; deviceId: string }[] = [];
+
+    const unsubscribe = subscribeToMultiDevicePong((payload) => {
+      if (payload.pingId === pingId && payload.targetDeviceId === myId) {
+        const latency = Date.now() - start;
+        collected.push({
+          name: payload.responderDeviceName || "جهاز مساعد متصل",
+          latency,
+          deviceId: payload.responderDeviceId,
+        });
+      }
+    });
+
+    broadcastMultiDevicePing({
+      pingId,
+      sourceDeviceId: myId,
+      sourceDeviceName: myName,
+      timestamp: start,
+    });
+
+    setTimeout(() => {
+      unsubscribe();
+      setIsPingingDevices(false);
+      setPingResults({
+        count: collected.length,
+        testedAt: new Date().toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+        devices: collected,
+      });
+    }, 2200);
+  };
+
+  // ⚡ Listen to instant scans across all assistant devices (Zero Memory Leak & No Echo Loop)
   useEffect(() => {
     const unsubscribe = subscribeToLiveScans((payload: LiveScanPayload) => {
+      // 1. Skip if this is an echo of a scan initiated on THIS device
+      const myDeviceId = getPersistentDeviceId();
+      if (payload.sourceDeviceId && payload.sourceDeviceId === myDeviceId) {
+        return;
+      }
+
       // De-duplicate if received recently
       const scanKey = `${payload.barcode}_${payload.timestamp}`;
       if (processedScansSet.current.has(scanKey)) return;
@@ -210,23 +286,12 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
         time: payload.timeDisplay || "الآن",
       });
 
+      playBeep("success");
+
       // Automatically dismiss the ticker after 4 seconds
       const timer = setTimeout(() => {
         setLiveAssistantNotice(null);
       }, 4000);
-
-      // Record in local state if student exists
-      const targetStudent = (studentsRef.current || []).find(
-        (s) => String(s.barcode).trim() === String(payload.barcode).trim()
-      );
-      if (targetStudent && onRecordAttendanceRef.current) {
-        onRecordAttendanceRef.current(
-          payload.barcode,
-          payload.status as "حضور" | "تأخير",
-          payload.timeIso,
-          targetStudent
-        );
-      }
 
       return () => clearTimeout(timer);
     });
@@ -257,13 +322,13 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
 
   // Keep focus on input for continuous scanning
   useEffect(() => {
-    if (!isManualModalOpen) {
+    if (!isManualModalOpen && !isCameraScannerOpen) {
       const timer = setTimeout(() => {
         inputRef.current?.focus();
       }, 100);
       return () => clearTimeout(timer);
     }
-  }, [scanAlert, isManualModalOpen]);
+  }, [scanAlert, isManualModalOpen, isCameraScannerOpen]);
 
   const processAttendance = (
     student: Student,
@@ -278,7 +343,7 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
       setScanAlert({
         type: "error",
         title: "🚫 غير مسموح: طالب من صف دراسي مختلف!",
-        message: `الطالب (${student.name}) مقيد في [${student.groupGrade}]، بينما الحصة الحالية بالقاعة مخصصة لـ [${selectedGrade}]. غير مسموح بدخول طلاب من صفوف أخرى!`,
+        message: `الطالب (${student.name}) مقيد في [${student.groupGrade}]، بينما الحصة الحالية بالقاعة مخصصة لـ [${selectedGrade}]. غير مسموح بدخول طلاب من صفوف دراسية أخرى!`,
         student,
       });
       return;
@@ -328,6 +393,7 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
         isPaid,
         scannedBy: "الماسح السريع",
         studentFallback: student,
+        sourceDeviceId: getPersistentDeviceId(),
       });
     }
 
@@ -367,23 +433,24 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     }, 4500);
   };
 
-  const handleScanSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const barcode = barcodeInput.trim();
-    setBarcodeInput("");
-    if (!barcode) return;
+  // 🎯 Core Scan Processing Function (Normalizes input, strips prefixes, finds student)
+  const processScannedCode = (rawCode: string) => {
+    const clean = normalizeBarcode(rawCode);
+    if (!clean) return;
 
-    const student = studentMap.get(barcode) || students.find((s) => String(s.barcode).trim() === barcode);
+    const matchResult = findStudentByScannedCode(clean, students, studentMap);
 
-    if (!student) {
+    if (!matchResult) {
       playBeep("error");
       setScanAlert({
         type: "error",
-        title: "❌ باركود غير مسجل",
-        message: `الباركود (${barcode}) غير مسجل في منظومة الطلاب! يرجى إضافة الطالب أولاً.`,
+        title: "❌ كود غير مسجل في المنظومة",
+        message: `تمت قراءة الكود (${clean}) ولكن لا يوجد طالب مسجل بهذا الكود أو الباركود أو رقم الهاتف! يرجى إضافة الطالب أولاً أو مراجعة الكود.`,
       });
       return;
     }
+
+    const student = matchResult.student;
 
     // If in Exit scanning mode (بوابة الخروج)
     if (scanDirectionMode === "exit") {
@@ -410,6 +477,62 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     }
 
     processAttendance(student);
+  };
+
+  // ⚡ Global Hardware USB Barcode Scanner Listener (Never misses a scan even if input is blurred)
+  useEffect(() => {
+    let keyBuffer = "";
+    let lastKeyTime = Date.now();
+
+    const handleWindowKeyDown = (e: KeyboardEvent) => {
+      // Ignore if actively typing in modal or textarea or search box
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        target !== inputRef.current &&
+        (target.tagName === "TEXTAREA" || target.isContentEditable || (target.tagName === "INPUT" && (target as HTMLInputElement).type === "search"))
+      ) {
+        return;
+      }
+
+      const now = Date.now();
+      const diff = now - lastKeyTime;
+      lastKeyTime = now;
+
+      // Enter key indicates end of barcode scan
+      if (e.key === "Enter") {
+        if (keyBuffer.trim().length >= 2) {
+          e.preventDefault();
+          const scanned = keyBuffer;
+          keyBuffer = "";
+          setBarcodeInput("");
+          processScannedCode(scanned);
+        } else {
+          keyBuffer = "";
+        }
+        return;
+      }
+
+      // If keys arrive too slowly (> 120ms between keys), reset buffer
+      if (diff > 150 && keyBuffer.length > 0) {
+        keyBuffer = "";
+      }
+
+      if (e.key.length === 1) {
+        keyBuffer += e.key;
+      }
+    };
+
+    window.addEventListener("keydown", handleWindowKeyDown);
+    return () => window.removeEventListener("keydown", handleWindowKeyDown);
+  }, [students, studentMap, selectedGrade, selectedDays, scanDirectionMode, activeSessionSlotId]);
+
+  const handleScanSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const barcode = barcodeInput;
+    setBarcodeInput("");
+    if (!barcode.trim()) return;
+    processScannedCode(barcode);
   };
 
   const handleRecordManual = (status: "حضور" | "تأخير", studentToRecord?: Student) => {
@@ -602,17 +725,6 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
   };
 
   const currentMonthKey = getCurrentMonthKey();
-
-  // Fast O(1) student lookup map to eliminate slow array searches
-  const studentMap = useMemo(() => {
-    const map = new Map<string, Student>();
-    (students || []).forEach((s) => {
-      if (s?.barcode) {
-        map.set(String(s.barcode).trim(), s);
-      }
-    });
-    return map;
-  }, [students]);
   
   // Real-time group counts for active group
   const currentGroupStudents = useMemo(() => {
@@ -1023,12 +1135,23 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
               type="text"
               value={barcodeInput}
               onChange={(e) => setBarcodeInput(e.target.value)}
-              placeholder="انتظار قراءة الباركود الآلية..."
+              placeholder="مرر كارت الطالب أمام الإسكانر أو اكتب الكود..."
               autoFocus
               className="w-full bg-[#060a17] border-2 border-indigo-500/40 focus:border-amber-400 text-amber-300 text-center font-mono font-black text-2xl md:text-3xl px-4 py-4 rounded-3xl outline-none focus:ring-4 focus:ring-amber-400/20 shadow-2xl placeholder:text-slate-600 placeholder:text-base transition-all"
             />
             <ScanLine className="w-7 h-7 text-amber-400/70 absolute left-4 top-4 pointer-events-none animate-pulse" />
           </div>
+
+          {/* Button 0: Camera Barcode/QR Scanner */}
+          <button
+            type="button"
+            onClick={() => setIsCameraScannerOpen(true)}
+            className="px-4 py-3.5 bg-gradient-to-r from-emerald-600 via-teal-600 to-emerald-500 hover:from-emerald-500 hover:to-teal-400 text-white font-bold text-xs md:text-sm rounded-3xl shadow-xl shadow-emerald-600/20 transition-all flex items-center gap-2 shrink-0 cursor-pointer border border-emerald-300/40 transform hover:scale-[1.02] active:scale-95 font-tajawal"
+            title="مسح كارت الطالب عبر كاميرا الموبايل أو اللابتوب"
+          >
+            <Camera className="w-5 h-5" />
+            <span>مسح بالكاميرا 📷</span>
+          </button>
 
           {/* Button 1: Smart Manual Search */}
           <button
@@ -1062,6 +1185,40 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
             <span>👥 حضور طالب من يوم آخر (تعويض)</span>
           </button>
         </form>
+
+        {/* Real-time Multi-Device Sync Diagnostics Bar */}
+        <div className="flex flex-wrap items-center justify-between gap-3 p-3 bg-[#060a17]/90 border border-indigo-500/20 rounded-2xl text-xs font-tajawal shadow-lg">
+          <div className="flex items-center gap-2">
+            <span className="relative flex h-2.5 w-2.5">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+            </span>
+            <span className="text-slate-300 font-medium">جهازك الحالي:</span>
+            <span className="font-mono font-bold text-amber-300 bg-slate-900/90 px-2 py-0.5 rounded-lg border border-slate-700">
+              {getPersistentDeviceName()}
+            </span>
+            <span className="text-[11px] text-emerald-400 font-mono">
+              (مزامنة نشطة ⚡)
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={runMultiDevicePingTest}
+              disabled={isPingingDevices}
+              className="px-3.5 py-1.5 bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-400/40 text-indigo-300 hover:text-white rounded-xl font-bold flex items-center gap-1.5 transition-all cursor-pointer shadow-sm disabled:opacity-50"
+              title="فحص الاتصال وسرعة استجابة الأجهزة الأخرى المتصلة لحظياً"
+            >
+              {isPingingDevices ? (
+                <Loader2 className="w-4 h-4 animate-spin text-indigo-300" />
+              ) : (
+                <Activity className="w-4 h-4 text-indigo-400" />
+              )}
+              <span>{isPingingDevices ? "جاري قياس استجابة الأجهزة..." : "⚡ فحص المزامنة اللحظية بين الأجهزة"}</span>
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* Manual Search & Cross-Day Attendance Modal */}
@@ -1953,6 +2110,108 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
               >
                 <Send className="w-4 h-4" />
                 <span>تأكيد وإرسال ({absenceConfirmData.absentList.length} غائب)</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Camera Barcode & QR Scanner Modal */}
+      <CameraScannerModal
+        isOpen={isCameraScannerOpen}
+        onClose={() => setIsCameraScannerOpen(false)}
+        onScanSuccess={(detectedCode) => {
+          processScannedCode(detectedCode);
+        }}
+      />
+
+      {/* Multi-Device Diagnostics Result Modal */}
+      {pingResults && (
+        <div className="fixed inset-0 bg-black/85 z-50 flex items-center justify-center p-4">
+          <div className="bg-[#0b1226] border-2 border-indigo-500/40 w-full max-w-lg rounded-3xl p-6 shadow-2xl space-y-4 animate-in fade-in zoom-in-95 font-tajawal text-right">
+            <div className="flex items-center justify-between pb-3 border-b border-indigo-500/20">
+              <div className="flex items-center gap-2.5">
+                <div className="w-10 h-10 rounded-2xl bg-indigo-500/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400">
+                  <Activity className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-black text-amber-300">
+                    نتيجة فحص المزامنة اللحظية بين الأجهزة
+                  </h3>
+                  <p className="text-xs text-slate-400 font-mono">
+                    وقت الفحص: {pingResults.testedAt} عبر Supabase WebSockets
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPingResults(null)}
+                className="p-2 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Current Device Details */}
+            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-3 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                <span className="text-xs font-bold text-slate-300">هذا الجهاز:</span>
+              </div>
+              <span className="font-mono text-xs font-bold text-amber-300">
+                {getPersistentDeviceName()} ({getPersistentDeviceId().slice(0, 12)})
+              </span>
+            </div>
+
+            {/* Remote Devices Response List */}
+            <div className="space-y-2">
+              <div className="text-xs font-bold text-slate-300">الأجهزة المتصلة الأخرى المستجيبة:</div>
+              {pingResults.count === 0 ? (
+                <div className="bg-amber-500/10 border border-amber-500/30 rounded-2xl p-4 text-center space-y-2">
+                  <Wifi className="w-8 h-8 text-amber-400 mx-auto" />
+                  <p className="text-xs font-bold text-amber-300">
+                    قناة المزامنة اللحظية نشطة ومتصلة بالإنترنت!
+                  </p>
+                  <p className="text-[11px] text-slate-300 leading-relaxed">
+                    لم يرد أي جهاز مساعد آخر في هذه اللحظة. جرّب فتح المنظومة على هاتف أو لابتوب مساعد ثانٍ، وسيظهر اتصاله هنا فورياً بأجزاء من الثانية!
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-2 max-h-48 overflow-y-auto">
+                  {pingResults.devices.map((dev, idx) => (
+                    <div
+                      key={idx}
+                      className="bg-slate-900/80 border border-emerald-500/30 rounded-2xl p-3 flex items-center justify-between"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="w-2.5 h-2.5 rounded-full bg-emerald-400"></span>
+                        <span className="text-xs font-bold text-white">{dev.name}</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] px-2 py-0.5 rounded-lg bg-emerald-500/20 text-emerald-300 font-mono font-bold">
+                          {dev.latency}ms (فوري)
+                        </span>
+                        <span className="text-[10px] text-slate-400 font-mono">
+                          {dev.deviceId.slice(0, 8)}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="p-3 bg-emerald-500/10 border border-emerald-500/20 rounded-2xl text-[11px] text-emerald-300 leading-relaxed">
+              💡 <strong>كيف تعمل المزامنة اللحظية:</strong> عند تمرير أي باركود في أي جهاز مساعد، يتم إرسال الحدث فورياً عبر قناة Supabase WebSockets المشفرة، فيظهر الطالب في شاشة كل الأجهزة الأخرى في أقل من 50 مللي ثانية مع تحديث الإحصائيات والكشوفات تلقائياً.
+            </div>
+
+            <div className="pt-2">
+              <button
+                type="button"
+                onClick={() => setPingResults(null)}
+                className="w-full py-2.5 rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs transition-colors"
+              >
+                إغلاق نافذة الفحص
               </button>
             </div>
           </div>

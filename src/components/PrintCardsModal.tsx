@@ -1,4 +1,5 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
+import QRCode from "qrcode";
 import { Student, GradeName, GRADE_ORDER } from "../types";
 import { TEACHER_NAME } from "../utils/helpers";
 import { printElement, downloadPrintableHtml } from "../utils/print";
@@ -11,11 +12,45 @@ interface PrintCardsModalProps {
 
 export const PrintCardsModal: React.FC<PrintCardsModalProps> = ({ students, onClose }) => {
   const [selectedGrade, setSelectedGrade] = useState<string>("ALL");
+  const [qrCodeMap, setQrCodeMap] = useState<Record<string, string>>({});
 
   const filteredStudents =
     selectedGrade === "ALL"
       ? students
       : students.filter((s) => s.groupGrade === selectedGrade);
+
+  useEffect(() => {
+    let isSubscribed = true;
+    const generateCodes = async () => {
+      const generated: Record<string, string> = {};
+      for (const st of filteredStudents) {
+        const raw = String(st.barcode || "").trim();
+        if (raw) {
+          try {
+            generated[raw] = await QRCode.toDataURL(raw, {
+              margin: 1,
+              width: 140,
+              errorCorrectionLevel: "M",
+              color: {
+                dark: "#000000",
+                light: "#ffffff",
+              },
+            });
+          } catch (e) {
+            console.warn("Failed to generate QR for", raw, e);
+          }
+        }
+      }
+      if (isSubscribed) {
+        setQrCodeMap(generated);
+      }
+    };
+
+    generateCodes();
+    return () => {
+      isSubscribed = false;
+    };
+  }, [filteredStudents]);
 
   const printCss = `
     @page { size: A4 portrait; margin: 8mm; }
@@ -185,35 +220,32 @@ export const PrintCardsModal: React.FC<PrintCardsModalProps> = ({ students, onCl
                 </div>
               </div>
 
-              {/* Barcode Visual & Code */}
-              <div className="border-t border-slate-200 pt-2 mt-2 flex flex-col items-center justify-center">
-                {/* Visual Barcode Bars Pattern */}
-                <div className="flex items-center justify-center gap-[2px] h-9 w-full max-w-[200px] my-0.5 px-2 bg-white">
-                  {student.barcode.split("").map((char, i) => {
-                    const code = char.charCodeAt(0);
-                    return (
-                      <React.Fragment key={i}>
-                        <div
-                          className="bg-black"
-                          style={{
-                            width: `${(code % 3) + 1.5}px`,
-                            height: "100%",
-                          }}
-                        />
-                        <div
-                          className="bg-transparent"
-                          style={{
-                            width: `${((code * 2) % 3) + 1}px`,
-                            height: "100%",
-                          }}
-                        />
-                      </React.Fragment>
-                    );
-                  })}
+              {/* Barcode & QR Code Section */}
+              <div className="border-t border-amber-200/60 pt-2 mt-2 flex items-center justify-between px-1">
+                <div className="text-right">
+                  <span className="text-[10px] text-slate-500 font-bold block">كود الباركود الذكي:</span>
+                  <div className="font-mono text-base font-black tracking-wider text-slate-950 mt-0.5">
+                    #{student.barcode}
+                  </div>
+                  <span className="text-[9px] text-emerald-800 font-extrabold bg-emerald-100 border border-emerald-300 px-2 py-0.5 rounded-full inline-block mt-1">
+                    جاهز للمسح الضوئي والكاميرا
+                  </span>
                 </div>
-                <div className="font-mono text-xs font-black tracking-widest text-slate-900 mt-0.5">
-                  *{student.barcode}*
-                </div>
+
+                {qrCodeMap[String(student.barcode).trim()] ? (
+                  <div className="flex flex-col items-center">
+                    <img
+                      src={qrCodeMap[String(student.barcode).trim()]}
+                      alt={`QR Code ${student.barcode}`}
+                      className="w-16 h-16 border border-slate-300 rounded-lg p-0.5 bg-white shadow-sm"
+                    />
+                    <span className="text-[8px] text-slate-500 font-mono mt-0.5">QR سريع</span>
+                  </div>
+                ) : (
+                  <div className="w-16 h-16 bg-slate-100 border border-slate-200 rounded-lg flex items-center justify-center text-[9px] text-slate-400 font-mono">
+                    جاري التوليد...
+                  </div>
+                )}
               </div>
             </div>
           ))

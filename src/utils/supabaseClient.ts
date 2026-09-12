@@ -34,6 +34,23 @@ export interface LiveScanPayload {
   isPaid: boolean;
   scannedBy: string;
   timestamp: number;
+  sourceDeviceId?: string;
+}
+
+export interface MultiDevicePingPayload {
+  pingId: string;
+  sourceDeviceId: string;
+  sourceDeviceName: string;
+  timestamp: number;
+}
+
+export interface MultiDevicePongPayload {
+  pingId: string;
+  targetDeviceId: string;
+  responderDeviceId: string;
+  responderDeviceName: string;
+  timestamp: number;
+  latencyMs?: number;
 }
 
 export interface GroupFinishedPayload {
@@ -222,6 +239,34 @@ export async function broadcastFullState(payload: any): Promise<void> {
   }
 }
 
+/** Broadcast instant multi-device ping for live latency check */
+export async function broadcastMultiDevicePing(payload: MultiDevicePingPayload): Promise<void> {
+  try {
+    const channel = getOrCreateRealtimeHub();
+    await channel.send({
+      type: "broadcast",
+      event: "multi_device_ping",
+      payload,
+    });
+  } catch (err) {
+    console.warn("Realtime broadcast multi-device ping notice:", err);
+  }
+}
+
+/** Broadcast pong response back to pinging device */
+export async function broadcastMultiDevicePong(payload: MultiDevicePongPayload): Promise<void> {
+  try {
+    const channel = getOrCreateRealtimeHub();
+    await channel.send({
+      type: "broadcast",
+      event: "multi_device_pong",
+      payload,
+    });
+  } catch (err) {
+    console.warn("Realtime broadcast multi-device pong notice:", err);
+  }
+}
+
 // ------------------------------------------------------------------------
 // 3. LISTENERS (Instant Reception on All Devices with Zero-Leak Lifecycle)
 // ------------------------------------------------------------------------
@@ -233,6 +278,8 @@ const homeworkChangeListeners = new Set<(payload: HomeworkSyncPayload) => void>(
 const studentChangeListeners = new Set<(payload: StudentSyncPayload) => void>();
 const examGradeChangeListeners = new Set<(payload: ExamGradeSyncPayload) => void>();
 const fullStateListeners = new Set<(payload: any) => void>();
+const multiDevicePingListeners = new Set<(payload: MultiDevicePingPayload) => void>();
+const multiDevicePongListeners = new Set<(payload: MultiDevicePongPayload) => void>();
 let listenersInitialized = false;
 
 function ensureChannelListenersRegistered() {
@@ -323,6 +370,30 @@ function ensureChannelListenersRegistered() {
       });
     }
   });
+
+  channel.on("broadcast", { event: "multi_device_ping" }, ({ payload }) => {
+    if (payload) {
+      multiDevicePingListeners.forEach((fn) => {
+        try {
+          fn(payload as MultiDevicePingPayload);
+        } catch (e) {
+          console.warn("Error in ping listener:", e);
+        }
+      });
+    }
+  });
+
+  channel.on("broadcast", { event: "multi_device_pong" }, ({ payload }) => {
+    if (payload) {
+      multiDevicePongListeners.forEach((fn) => {
+        try {
+          fn(payload as MultiDevicePongPayload);
+        } catch (e) {
+          console.warn("Error in pong listener:", e);
+        }
+      });
+    }
+  });
 }
 
 export function subscribeToLiveScans(
@@ -392,6 +463,26 @@ export function subscribeToFullState(
   fullStateListeners.add(onFullStateReceived);
   return () => {
     fullStateListeners.delete(onFullStateReceived);
+  };
+}
+
+export function subscribeToMultiDevicePing(
+  onPingReceived: (payload: MultiDevicePingPayload) => void
+): () => void {
+  ensureChannelListenersRegistered();
+  multiDevicePingListeners.add(onPingReceived);
+  return () => {
+    multiDevicePingListeners.delete(onPingReceived);
+  };
+}
+
+export function subscribeToMultiDevicePong(
+  onPongReceived: (payload: MultiDevicePongPayload) => void
+): () => void {
+  ensureChannelListenersRegistered();
+  multiDevicePongListeners.add(onPongReceived);
+  return () => {
+    multiDevicePongListeners.delete(onPongReceived);
   };
 }
 
