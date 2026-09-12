@@ -32,22 +32,8 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
   return bytes.buffer;
 }
 
-const STATUS_TO_CODE: Record<string, number> = {
-  "حضور": 1,
-  "غائب": 2,
-  "تأخير": 3,
-  "إذن": 4,
-  "حضور تعويضي": 5,
-  "تأخير تعويضي": 6,
-};
-const CODE_TO_STATUS: Record<number, string> = {
-  1: "حضور",
-  2: "غائب",
-  3: "تأخير",
-  4: "إذن",
-  5: "حضور تعويضي",
-  6: "تأخير تعويضي",
-};
+const STATUS_TO_CODE: Record<string, number> = { "حضور": 1, "غائب": 2, "تأخير": 3, "إذن": 4 };
+const CODE_TO_STATUS: Record<number, string> = { 1: "حضور", 2: "غائب", 3: "تأخير", 4: "إذن" };
 
 function compactStudent(s: any): any {
   if (!s || typeof s !== "object") return s;
@@ -108,14 +94,12 @@ function compactAttendanceMap(attMap: any): any {
   return res;
 }
 
-export function hydrateAttendanceMap(attMap: any): Record<string, string> {
-  if (!attMap || typeof attMap !== "object") return {};
+function hydrateAttendanceMap(attMap: any): any {
+  if (!attMap || typeof attMap !== "object") return attMap;
   const res: Record<string, string> = {};
   for (const [k, v] of Object.entries(attMap)) {
-    if (v === null || v === undefined) continue;
-    const num = Number(v);
-    if ((typeof v === "number" || (typeof v === "string" && /^[1-6]$/.test(v.trim()))) && CODE_TO_STATUS[num]) {
-      res[k] = CODE_TO_STATUS[num];
+    if (typeof v === "number" && CODE_TO_STATUS[v]) {
+      res[k] = CODE_TO_STATUS[v];
     } else {
       res[k] = String(v);
     }
@@ -132,13 +116,11 @@ function compactHistory(history: any): any {
   return res;
 }
 
-export function hydrateHistory(history: any): Record<string, Record<string, string>> {
-  if (!history || typeof history !== "object") return {};
-  const res: Record<string, Record<string, string>> = {};
+function hydrateHistory(history: any): any {
+  if (!history || typeof history !== "object") return history;
+  const res: Record<string, any> = {};
   for (const [date, dayMap] of Object.entries(history)) {
-    if (dayMap && typeof dayMap === "object") {
-      res[date] = hydrateAttendanceMap(dayMap);
-    }
+    res[date] = hydrateAttendanceMap(dayMap);
   }
   return res;
 }

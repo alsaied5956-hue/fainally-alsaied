@@ -11,10 +11,6 @@ import {
   openWhatsApp,
   evaluateAttendanceStatus,
   isStudentPaid,
-  getTodayKey,
-  getImmediatelyPrecedingClassDate,
-  getArabicDayName,
-  normalizeAttendanceStatus,
 } from "../utils/helpers";
 import { playBeep, speakArabicGreeting } from "../utils/audio";
 import { StudentSearchBox } from "./StudentSearchBox";
@@ -66,7 +62,6 @@ import {
 interface AttendanceScannerProps {
   students: Student[];
   attendanceToday: Record<string, string>;
-  attendanceHistory?: Record<string, Record<string, string>>;
   scanLogOrder: string[];
   scanLogTimes: Record<string, string>;
   payments: Record<string, Record<string, PaymentRecord>>;
@@ -83,8 +78,7 @@ interface AttendanceScannerProps {
     days: GroupDays,
     absentList: { student: Student; message: string; type: "غائب" }[],
     lateList: { student: Student; message: string; type: "تأخير" }[],
-    crossDayList?: { student: Student; message: string; type: "عكس_أيام" }[],
-    advanceCompensationList?: { student: Student; prevDateKey: string; prevStatus: string }[]
+    crossDayList?: { student: Student; message: string; type: "عكس_أيام" }[]
   ) => void;
   onRemoveFromScanner?: (barcode: string) => void;
   onClearSessionScans?: (grade: GradeName, resetTodayAttendance?: boolean) => void;
@@ -96,7 +90,6 @@ interface AttendanceScannerProps {
 export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
   students,
   attendanceToday,
-  attendanceHistory,
   scanLogOrder,
   scanLogTimes,
   payments,
@@ -160,7 +153,6 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     absentList: { student: Student; message: string; type: "غائب" }[];
     lateList: { student: Student; message: string; type: "تأخير" }[];
     crossDayList: { student: Student; message: string; type: "عكس_أيام" }[];
-    advanceCompensationList: { student: Student; prevDateKey: string; prevStatus: string }[];
     presentCount: number;
     totalStudents: number;
   } | null>(null);
@@ -567,39 +559,24 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     const absentList: { student: Student; message: string; type: "غائب" }[] = [];
     const lateList: { student: Student; message: string; type: "تأخير" }[] = [];
     const crossDayList: { student: Student; message: string; type: "عكس_أيام" }[] = [];
-    const advanceCompensationList: { student: Student; prevDateKey: string; prevStatus: string }[] = [];
     let presentCount = 0;
 
     // طابور الحضور الفعلي بالقاعة الحالية (الطلاب الذين تم مسح كروت دخولهم)
     const queueBarcodeSet = new Set((scanLogOrder || []).map((b) => String(b).trim()));
-    const prevDateRecords = (prevClassDateKey && attendanceHistory?.[prevClassDateKey]) || {};
 
     groupStudents.forEach((student) => {
       const bCode = String(student.barcode).trim();
       const isPresentInQueue = queueBarcodeSet.has(bCode);
 
       if (!isPresentInQueue) {
-        // فحص ما إذا كان الطالب قد حضر تعويضاً في اليوم السابق مباشرة
-        const rawPrevStatus = prevDateRecords[bCode];
-        const prevStatus = normalizeAttendanceStatus(rawPrevStatus);
-        const attendedInAdvance = Boolean(prevStatus && (prevStatus.includes("حضور") || prevStatus.includes("تعويض") || prevStatus === "تأخير"));
-
-        if (attendedInAdvance) {
-          advanceCompensationList.push({
-            student,
-            prevDateKey: prevClassDateKey,
-            prevStatus,
-          });
-        } else {
-          // الطالب مقيد بهذه المجموعة ولم يحضر اليوم ولم يعوض في اليوم السابق -> غائب
-          const msg =
-            `تنبيه من منظومة الأستاذة إيمان الدمشيتي 📐\n` +
-            `نفيدكم بعلم أن الطالب/ة: (${student.name})\n` +
-            `المقيد في الصف: [${student.groupGrade}] - مجموعة: [${student.groupDays}]\n` +
-            `قد تغيب اليوم عن حضور حصة الرياضيات (${new Date().toLocaleDateString("ar-EG")}).\n` +
-            `نرجو منكم المتابعة والاهتمام حرصاً على مستواه الدراسي وعدم تفويت المنهج.`;
-          absentList.push({ student, message: msg, type: "غائب" });
-        }
+        // الطالب مقيد بهذه المجموعة ولكنه لم يمر على الإسكانر -> غائب
+        const msg =
+          `تنبيه من منظومة الأستاذة إيمان الدمشيتي 📐\n` +
+          `نفيدكم بعلم أن الطالب/ة: (${student.name})\n` +
+          `المقيد في الصف: [${student.groupGrade}] - مجموعة: [${student.groupDays}]\n` +
+          `قد تغيب اليوم عن حضور حصة الرياضيات (${new Date().toLocaleDateString("ar-EG")}).\n` +
+          `نرجو منكم المتابعة والاهتمام حرصاً على مستواه الدراسي وعدم تفويت المنهج.`;
+        absentList.push({ student, message: msg, type: "غائب" });
       } else {
         // الطالب مسجل حضور في طابور الحصة
         const currentStatus = attendanceToday?.[student.barcode];
@@ -658,7 +635,6 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
       absentList,
       lateList,
       crossDayList,
-      advanceCompensationList,
       presentCount,
       totalStudents: groupStudents.length,
     });
@@ -693,11 +669,11 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
   const handleConfirmAndSendAbsence = () => {
     if (!absenceConfirmData) return;
 
-    const { grade, days, absentList, lateList, crossDayList, advanceCompensationList, presentCount } = absenceConfirmData;
+    const { grade, days, absentList, lateList, crossDayList, presentCount } = absenceConfirmData;
 
     // 1. Permanently record attendance in today's state and history, and clear group & cross-day from active scanner queue
     if (onFinishGroup) {
-      onFinishGroup(grade, days, absentList, lateList, crossDayList, advanceCompensationList);
+      onFinishGroup(grade, days, absentList, lateList, crossDayList);
     }
 
     // 1️⃣ Live Event Pipeline: Instant broadcast for absent and late students to `live_events/today`
@@ -756,26 +732,6 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
       (s) => s.groupGrade === selectedGrade && s.groupDays === selectedDays
     );
   }, [students, selectedGrade, selectedDays]);
-
-  // Immediately preceding class date in attendance history
-  const prevClassDateKey = useMemo(() => {
-    return getImmediatelyPrecedingClassDate(getTodayKey(), attendanceHistory);
-  }, [attendanceHistory]);
-
-  // Students of the current group who attended in advance on the immediately preceding class date
-  // (Excluding students who are already scanned and present in today's room queue)
-  const advanceAttendedStudents = useMemo(() => {
-    if (!prevClassDateKey || !attendanceHistory?.[prevClassDateKey]) return [];
-    const prevDateMap = attendanceHistory[prevClassDateKey] || {};
-    const queueBarcodeSet = new Set((scanLogOrder || []).map((b) => String(b).trim()));
-    return currentGroupStudents.filter((s) => {
-      // If the student already scanned into the room today, they are present in person -> no advance compensation needed
-      if (queueBarcodeSet.has(String(s.barcode).trim())) return false;
-      const rawSt = prevDateMap[s.barcode];
-      const st = normalizeAttendanceStatus(rawSt);
-      return Boolean(st && (st.includes("حضور") || st.includes("تعويض") || st === "تأخير"));
-    });
-  }, [currentGroupStudents, prevClassDateKey, attendanceHistory, scanLogOrder]);
 
   // Students of the SAME grade but OTHER days (available for makeup attendance)
   const otherDaysSameGradeStudents = useMemo(() => {
@@ -1033,24 +989,6 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
             </button>
           )}
         </div>
-
-        {/* Notice of students who attended in advance on the immediately preceding class date */}
-        {advanceAttendedStudents.length > 0 && (
-          <div className="w-full bg-blue-950/50 border border-blue-500/30 px-3.5 py-2 rounded-2xl flex flex-wrap items-center justify-between gap-2 text-xs text-blue-200 mt-2">
-            <div className="flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-blue-400 shrink-0"></span>
-              <span>
-                💡 يوجد <strong className="text-white font-mono">{advanceAttendedStudents.length}</strong> طالب مقيد بهذه المجموعة حضروا تعويضياً في اليوم السابق مباشرة ({prevClassDateKey}) ومحسوبون حضور تعويضي:
-              </span>
-              <span className="font-bold text-blue-300">
-                {advanceAttendedStudents.map((s) => s.name).join("، ")}
-              </span>
-            </div>
-            <span className="text-[11px] bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded-full border border-blue-400/20">
-              لن يسجل عليهم غياب عند حفظ وإرسال المجموعة
-            </span>
-          </div>
-        )}
       </div>
 
       {/* Finished Group Banner Notice */}
@@ -2000,7 +1938,7 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
             </div>
 
             {/* Quick Metrics Bar */}
-            <div className={`grid grid-cols-2 ${absenceConfirmData.advanceCompensationList.length > 0 ? "sm:grid-cols-5" : "sm:grid-cols-4"} gap-2 text-center shrink-0`}>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center shrink-0">
               <div className="bg-slate-900/80 border border-slate-800 p-2.5 rounded-2xl">
                 <div className="text-[11px] text-slate-400 font-bold">إجمالي المقيدين</div>
                 <div className="text-base font-black text-white">{absenceConfirmData.totalStudents}</div>
@@ -2017,12 +1955,6 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
                 <div className="text-[11px] text-rose-300 font-bold">الغياب المستحق</div>
                 <div className="text-base font-black text-rose-400">{absenceConfirmData.absentList.length}</div>
               </div>
-              {absenceConfirmData.advanceCompensationList.length > 0 && (
-                <div className="bg-blue-950/50 border border-blue-500/40 p-2.5 rounded-2xl col-span-2 sm:col-span-1">
-                  <div className="text-[11px] text-blue-300 font-bold">حضور تعويضي مسبق</div>
-                  <div className="text-base font-black text-blue-400">{absenceConfirmData.advanceCompensationList.length}</div>
-                </div>
-              )}
             </div>
 
             {/* Explanatory Notice */}
@@ -2158,34 +2090,7 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
               )}
             </div>
 
-            {/* Advance Compensation Students Section (if any) */}
-            {absenceConfirmData.advanceCompensationList && absenceConfirmData.advanceCompensationList.length > 0 && (
-              <div className="bg-blue-950/40 border border-blue-500/30 rounded-2xl p-3 space-y-2 shrink-0">
-                <div className="flex items-center justify-between gap-2 text-xs">
-                  <div className="flex items-center gap-2 font-black text-blue-300">
-                    <CheckCircle2 className="w-4 h-4 text-blue-400" />
-                    <span>طلاب مقيدون بهذه المجموعة وحضروا تعويضياً في اليوم السابق ({absenceConfirmData.advanceCompensationList[0]?.prevDateKey}):</span>
-                  </div>
-                  <span className="text-[11px] bg-blue-500/20 text-blue-300 font-bold px-2 py-0.5 rounded-full border border-blue-400/30">
-                    {absenceConfirmData.advanceCompensationList.length} طالب (حضور تعويضي مسبق - لا يسجل غياب)
-                  </span>
-                </div>
-                <div className="flex flex-wrap gap-2 pt-1">
-                  {absenceConfirmData.advanceCompensationList.map((item, idx) => (
-                    <div
-                      key={item.student.barcode || idx}
-                      className="bg-blue-900/40 border border-blue-500/30 px-2.5 py-1 rounded-xl text-xs flex items-center gap-2 text-white"
-                    >
-                      <span className="font-bold">{item.student.name}</span>
-                      <span className="font-mono text-[10px] text-blue-300">({item.student.barcode})</span>
-                      <span className="text-[10px] bg-emerald-500/20 text-emerald-300 font-bold px-1.5 py-0.2 rounded">
-                        حضر سابقاً: {item.prevStatus}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
+            {/* Footer with the 2 MANDATORY options */}
             <div className="pt-3 border-t border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0">
               {/* Option 2: إلغاء / العودة للتعديل */}
               <button

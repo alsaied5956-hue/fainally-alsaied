@@ -13,7 +13,7 @@ import {
 import { DEFAULT_GRADE_PRICES, getTodayKey, formatTimeArabic } from "./helpers";
 import { db, ensureFirebaseAuth } from "./firebase";
 import { doc, setDoc, getDoc, onSnapshot, writeBatch } from "firebase/firestore";
-import { compressData, decompressData, compactSystemPayload, hydrateSystemPayload, hydrateHistory, hydrateAttendanceMap } from "./compression";
+import { compressData, decompressData, compactSystemPayload, hydrateSystemPayload } from "./compression";
 import { saveSnapshotToIndexedDB, loadSnapshotFromIndexedDB } from "./indexedDB";
 import {
   isBulkSyncActive,
@@ -473,7 +473,7 @@ export function loadLocalData(): SystemData {
       if (typeof timeIso === "string" && timeIso.includes("T")) {
         return timeIso.startsWith(todayKey);
       }
-      return false;
+      return true;
     });
 
     const filteredScanTimes: Record<string, string> = {};
@@ -516,16 +516,11 @@ export function loadLocalData(): SystemData {
 
     const loaded: SystemData = {
       students: finalStudents,
-      attendanceHistory: hydrateHistory({
+      attendanceHistory: {
         ...backupHistory,
         ...(parsed.attendanceHistory || {}),
-      }),
-      attendanceToday: hydrateAttendanceMap(
-        parsed.attendanceHistory?.[todayKey] ||
-          (parsed.attendanceToday && Object.keys(parsed.attendanceToday).some((b) => filteredScanTimes[b])
-            ? parsed.attendanceToday
-            : {})
-      ),
+      },
+      attendanceToday: parsed.attendanceHistory?.[todayKey] || parsed.attendanceToday || backupToday || {},
       scanLogTimes: filteredScanTimes,
       payments: mergedPayments,
       scanLogOrder: initialScanOrder,
@@ -653,10 +648,10 @@ export async function hydrateFromIndexedDB(): Promise<void> {
         snapshot.students && snapshot.students.length > 0 && snapUpdated >= currUpdated
           ? snapshot.students
           : currentLocal.students,
-      attendanceHistory: hydrateHistory({
+      attendanceHistory: {
         ...(snapshot.attendanceHistory || {}),
         ...(currentLocal.attendanceHistory || {}),
-      }),
+      },
       payments: {
         ...(snapshot.payments || {}),
         ...(currentLocal.payments || {}),
@@ -1459,7 +1454,7 @@ export function mergeCloudDataWithLocal(local: SystemData, cloud: Partial<System
     if (typeof timeIso === "string" && timeIso.includes("T")) {
       return timeIso.startsWith(todayKey);
     }
-    return false;
+    return true;
   });
 
   const mergedScanTimes: Record<string, string> = {};
@@ -2552,9 +2547,8 @@ export function saveAttendanceAndStudentsBatch(
   scanLogOrder: string[],
   scanLogTimes: Record<string, string>,
   students: Student[],
-  immediateSync: boolean = true,
-  deferCloudSyncUntilGroupFinished: boolean = false,
-  customAttendanceHistory?: Record<string, Record<string, string>>
+  immediateSync: boolean = false,
+  deferCloudSyncUntilGroupFinished: boolean = false
 ): void {
   const current = loadLocalData();
   const todayKey = getTodayKey();
@@ -2565,7 +2559,6 @@ export function saveAttendanceAndStudentsBatch(
     attendanceToday,
     attendanceHistory: {
       ...current.attendanceHistory,
-      ...(customAttendanceHistory || {}),
       [todayKey]: attendanceToday,
     },
     scanLogOrder,
@@ -2575,11 +2568,14 @@ export function saveAttendanceAndStudentsBatch(
   };
 
   if (deferCloudSyncUntilGroupFinished && !immediateSync) {
-    // Instant local persistence + peer-to-peer device broadcast
+    // 1. Instant local persistence (0ms latency, zero quota)
     saveToLocalStorage(updated);
+
+    // Broadcast instantly to other connected laptops/mobiles (< 50ms)
     pushToServerSyncHub(updated).catch(() => {});
     broadcastFullState(updated).catch(() => {});
 
+    // 2. Broadcast to local tabs/windows via zero-quota channel
     recordSmartOperation(
       "state_mutation",
       {
@@ -2594,19 +2590,19 @@ export function saveAttendanceAndStudentsBatch(
       notifySyncStatusChange();
     }
 
+    // 3. Clear rapid debounce timer so individual scans NEVER trigger cloud writes
     if (debounceSyncTimer) {
       clearTimeout(debounceSyncTimer);
       debounceSyncTimer = null;
     }
 
-    // Flush quickly after brief inactivity
+    // 4. Group session idle safeguard: if inactive for 90 seconds, flush the entire group as a single write
     debounceSyncTimer = setTimeout(() => {
       debounceSyncTimer = null;
       flushPendingSyncToCloud().catch(() => {});
-    }, 5000);
+    }, 90000);
   } else {
-    // Instant real-time cloud synchronization without limit
-    syncDataToCloud(updated, true);
+    syncDataToCloud(updated, immediateSync);
   }
 }
 
