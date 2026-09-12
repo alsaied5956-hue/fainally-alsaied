@@ -232,26 +232,22 @@ export default function App() {
       setSyncStatus(status);
     });
 
-    const handleSyncCompleted = (e?: Event) => {
-      const customEvent = e as CustomEvent<any>;
-      const isWiped = customEvent?.detail?.wipedLocalStorage;
+    const handleSyncCompleted = () => {
       setSyncBanner({
         show: true,
         type: "online-synced",
-        message: isWiped
-          ? "☁️ تم حفظ وتسجيل كافة التعديلات على السحابة (Firebase) ومسح الذاكرة المحلية للجهاز بنجاح!"
-          : "تم الاتصال بالسحابة وتأكيد حفظ البيانات بنجاح!",
+        message: "☁️ تم حفظ ومزامنة كافة التعديلات بنجاح وتحديث كافة الأجهزة!",
       });
       setTimeout(() => {
         setSyncBanner(null);
-      }, 5000);
+      }, 4000);
     };
 
     const handleOffline = () => {
       setSyncBanner({
         show: true,
         type: "offline-mode",
-        message: "⚠️ أنت الآن في وضع الأوفلاين (بدون نت) - يتم الحفظ مؤقتاً على الذاكرة المحلية، وسيتم رفع التعديلات للسحابة ومسحها فور عودة الإنترنت.",
+        message: "⚠️ وضع العمل بدون إنترنت - يتم حفظ كافة التعديلات والبيانات محلياً على الجهاز بأمان، وستتم المزامنة تلقائياً عند عودة الإنترنت.",
       });
     };
 
