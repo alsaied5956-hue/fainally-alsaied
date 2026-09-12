@@ -395,10 +395,23 @@ export function loadLocalData(): SystemData {
   if (typeof window === "undefined") return INITIAL_SYSTEM_DATA;
 
   try {
-    const raw =
-      localStorage.getItem(STORAGE_KEY) ||
-      localStorage.getItem("center_data") ||
-      localStorage.getItem("aiman_system_data");
+    const isOnline = typeof navigator !== "undefined" ? navigator.onLine : true;
+    const hasOfflinePending =
+      localStorage.getItem("center_has_offline_data") === "true" ||
+      localStorage.getItem(PENDING_SYNC_KEY) === "true";
+
+    let raw: string | null = null;
+    // Strictly isolate LocalStorage: Only read if offline or if pending offline changes exist
+    if (!isOnline || hasOfflinePending) {
+      raw =
+        localStorage.getItem("center_offline_pending_data") ||
+        localStorage.getItem(STORAGE_KEY) ||
+        localStorage.getItem("center_data") ||
+        localStorage.getItem("aiman_system_data");
+    } else {
+      // Online mode with no pending changes: ensure LocalStorage is clean
+      cleanupLegacyStorageKeys();
+    }
 
     let parsed: any = {};
     if (raw) {
@@ -544,11 +557,31 @@ export function cleanupLegacyStorageKeys(): void {
     "aiman_payments",
     "aiman_backup",
     "eman_temp_export",
+    "center_data_v2",
   ];
   for (const k of legacyKeys) {
     try {
       localStorage.removeItem(k);
     } catch {}
+  }
+}
+
+/**
+ * Wipes any temporary offline data from LocalStorage.
+ * The system has NO dependency or persistent data in LocalStorage when online.
+ * Data is pushed and persisted to Cloud (Firestore) and then immediately deleted from LocalStorage.
+ */
+export function clearOfflineLocalStorage(): void {
+  if (typeof window === "undefined" || typeof localStorage === "undefined") return;
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem("center_offline_pending_data");
+    localStorage.removeItem("center_has_offline_data");
+    localStorage.removeItem(PENDING_SYNC_KEY);
+    cleanupLegacyStorageKeys();
+    console.log("[Storage Engine] LocalStorage wiped clean: Data is now 100% on Cloud.");
+  } catch (err) {
+    console.warn("Notice clearing offline storage:", err);
   }
 }
 
@@ -646,44 +679,37 @@ function performDiskPersist(clonedData: SystemData) {
     return;
   }
 
-  // 1. Asynchronously persist full unabridged snapshot into IndexedDB (High capacity, zero quota issues)
-  saveSnapshotToIndexedDB(STORAGE_KEY, clonedData).catch(() => {});
+  const isOnline = typeof navigator !== "undefined" ? navigator.onLine : true;
 
-  // 2. Save to LocalStorage with fallback strategies to prevent QuotaExceededError
+  // STRICT REQUIREMENT: LocalStorage has NO relationship with the system when online!
+  // All online persistence is held in memory and committed directly to the Cloud (Firebase).
+  if (isOnline) {
+    clearOfflineLocalStorage();
+    return;
+  }
+
+  // ONLY WHEN OFFLINE: Save to LocalStorage as a temporary offline buffer until internet reconnects
   try {
-    // Strategy A: Compacted payload (lossless, 60-75% smaller than raw JSON)
     const compacted = compactSystemPayload(clonedData);
     const serialized = JSON.stringify(compacted);
+    localStorage.setItem("center_offline_pending_data", serialized);
     localStorage.setItem(STORAGE_KEY, serialized);
+    localStorage.setItem("center_has_offline_data", "true");
+    localStorage.setItem(PENDING_SYNC_KEY, "true");
+    console.log("[Storage Engine] OFFLINE MODE: Saved temporary buffer to LocalStorage. Will flush to Cloud and wipe upon reconnect.");
   } catch (err: any) {
-    // Quota exceeded: clean legacy keys and try leaner strategies
     cleanupLegacyStorageKeys();
 
     try {
-      // Strategy B: Lean cache + compaction (preserves all students + recent months/dates)
       const leanData = createLeanSystemCache(clonedData);
       const leanCompacted = compactSystemPayload(leanData);
       const leanSerialized = JSON.stringify(leanCompacted);
+      localStorage.setItem("center_offline_pending_data", leanSerialized);
       localStorage.setItem(STORAGE_KEY, leanSerialized);
+      localStorage.setItem("center_has_offline_data", "true");
+      localStorage.setItem(PENDING_SYNC_KEY, "true");
     } catch (err2: any) {
-      // Strategy C: Ultra-lean cache (students + config + today's scans only)
-      try {
-        const ultraLean = {
-          students: clonedData.students,
-          attendanceToday: clonedData.attendanceToday,
-          scanLogTimes: clonedData.scanLogTimes,
-          scanLogOrder: clonedData.scanLogOrder,
-          usersList: clonedData.usersList,
-          groupPrices: clonedData.groupPrices,
-          activeSessionSlotId: clonedData.activeSessionSlotId,
-          updatedAt: clonedData.updatedAt,
-          _isUltraLean: true,
-        };
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(compactSystemPayload(ultraLean)));
-      } catch (err3) {
-        // Safe graceful fallback: data is completely preserved in memoryCachedData & IndexedDB
-        console.warn("LocalStorage quota full; persisted completely to IndexedDB & memory cache.");
-      }
+      console.warn("[Storage Engine] LocalStorage offline buffer full; preserved in memory cache.");
     }
   }
 }
@@ -1112,9 +1138,14 @@ export async function flushPendingSyncToCloud(forceManual: boolean = false): Pro
     const currentUpToDateData = loadLocalData();
     lastSyncedDataHash = JSON.stringify(currentUpToDateData);
 
-    localStorage.setItem(PENDING_SYNC_KEY, "false");
+    // CRITICAL USER REQUIREMENT: Data is now safely recorded in Firebase Firestore & Cloud!
+    // Completely wipe and delete any offline data/buffer from LocalStorage!
+    clearOfflineLocalStorage();
+
     const nowIso = new Date().toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-    localStorage.setItem(LAST_SYNC_TIME_KEY, nowIso);
+    try {
+      localStorage.setItem(LAST_SYNC_TIME_KEY, nowIso);
+    } catch {}
 
     successfulSyncs++;
     consecutiveFailures = 0;
@@ -1128,7 +1159,7 @@ export async function flushPendingSyncToCloud(forceManual: boolean = false): Pro
     // Dispatch global custom event
     window.dispatchEvent(
       new CustomEvent("cloud-sync-completed", {
-        detail: { timestamp: new Date().toISOString() },
+        detail: { timestamp: new Date().toISOString(), wipedLocalStorage: true },
       })
     );
 
@@ -2262,12 +2293,26 @@ if (typeof window !== "undefined") {
   let recoveryDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   const triggerDebouncedRecovery = () => {
     if (recoveryDebounceTimer) clearTimeout(recoveryDebounceTimer);
-    recoveryDebounceTimer = setTimeout(() => {
+    recoveryDebounceTimer = setTimeout(async () => {
       recoveryDebounceTimer = null;
       if (navigator.onLine) {
         notifySyncStatusChange();
         restartCloudListener();
-        pullLatestCloudDataImmediately().catch(() => {});
+        const hasOffline =
+          localStorage.getItem(PENDING_SYNC_KEY) === "true" ||
+          localStorage.getItem("center_has_offline_data") === "true" ||
+          Boolean(localStorage.getItem("center_offline_pending_data"));
+
+        if (hasOffline) {
+          console.log("[Storage Engine] Online restored with pending offline buffer. Flushing to Cloud and wiping LocalStorage...");
+          const success = await flushPendingSyncToCloud(true);
+          if (success) {
+            clearOfflineLocalStorage();
+          }
+        } else {
+          pullLatestCloudDataImmediately().catch(() => {});
+          clearOfflineLocalStorage();
+        }
       }
     }, 800);
   };
@@ -2294,9 +2339,9 @@ if (typeof window !== "undefined") {
     }
   });
 
-  // 5. Guaranteed flush on tab close / reload
+  // 5. Guaranteed flush on tab close / reload ONLY if offline
   window.addEventListener("beforeunload", () => {
-    if (memoryCachedData) {
+    if (memoryCachedData && !navigator.onLine) {
       try {
         saveToLocalStorage(memoryCachedData, false);
       } catch (e) {}
@@ -2436,14 +2481,28 @@ export function clearAllSystemData(): void {
 
 /**
  * Automatically inspects the local disk (localStorage) and immediately pushes any pending
- * unsynced local changes to Firestore Cloud Database.
+ * unsynced local offline changes to Firestore Cloud Database.
+ * Once successfully confirmed in the Cloud, it deletes them completely from LocalStorage.
  */
 export async function autoPushLocalDiskOnStartup(): Promise<boolean> {
   if (typeof window === "undefined") return false;
   try {
-    const hasPending = localStorage.getItem(PENDING_SYNC_KEY) === "true";
-    if (hasPending) {
-      return await flushPendingSyncToCloud(false);
+    const isOnline = typeof navigator !== "undefined" ? navigator.onLine : true;
+    const hasPending =
+      localStorage.getItem(PENDING_SYNC_KEY) === "true" ||
+      localStorage.getItem("center_has_offline_data") === "true" ||
+      Boolean(localStorage.getItem("center_offline_pending_data"));
+
+    if (hasPending && isOnline) {
+      console.log("[Storage Engine] Detected offline changes in LocalStorage. Uploading to Firestore and wiping LocalStorage...");
+      const success = await flushPendingSyncToCloud(true);
+      if (success) {
+        clearOfflineLocalStorage();
+      }
+      return success;
+    } else if (isOnline) {
+      // Clean up any remaining legacy data so LocalStorage is completely empty of database records
+      clearOfflineLocalStorage();
     }
     return true;
   } catch (err) {

@@ -228,11 +228,15 @@ export default function App() {
       setSyncStatus(status);
     });
 
-    const handleSyncCompleted = () => {
+    const handleSyncCompleted = (e?: Event) => {
+      const customEvent = e as CustomEvent<any>;
+      const isWiped = customEvent?.detail?.wipedLocalStorage;
       setSyncBanner({
         show: true,
         type: "online-synced",
-        message: "تم الاتصال بالسحابة ومزامنة كافة التعديلات بنجاح!",
+        message: isWiped
+          ? "☁️ تم حفظ وتسجيل كافة التعديلات على السحابة (Firebase) ومسح الذاكرة المحلية للجهاز بنجاح!"
+          : "تم الاتصال بالسحابة وتأكيد حفظ البيانات بنجاح!",
       });
       setTimeout(() => {
         setSyncBanner(null);
@@ -243,7 +247,15 @@ export default function App() {
       setSyncBanner({
         show: true,
         type: "offline-mode",
-        message: "أنت الآن في وضع الأوفلاين (بدون نت) - المنظومة تعمل بالكامل وسيتم المزامنة تلقائياً عند عودة النت.",
+        message: "⚠️ أنت الآن في وضع الأوفلاين (بدون نت) - يتم الحفظ مؤقتاً على الذاكرة المحلية، وسيتم رفع التعديلات للسحابة ومسحها فور عودة الإنترنت.",
+      });
+    };
+
+    const handleOnline = () => {
+      setSyncBanner({
+        show: true,
+        type: "online-synced",
+        message: "⚡ تم استعادة الاتصال بالإنترنت - جاري رفع التعديلات فوراً للسحابة ومسحها من الذاكرة المحلية...",
       });
     };
 
@@ -259,6 +271,7 @@ export default function App() {
 
     window.addEventListener("cloud-sync-completed", handleSyncCompleted);
     window.addEventListener("offline", handleOffline);
+    window.addEventListener("online", handleOnline);
     window.addEventListener("whatsapp-queue-updated", handleQueueUpdated);
     window.addEventListener("platform-messages-updated", handlePlatformMessagesUpdated);
 
@@ -266,6 +279,7 @@ export default function App() {
       unsubscribeSync();
       window.removeEventListener("cloud-sync-completed", handleSyncCompleted);
       window.removeEventListener("offline", handleOffline);
+      window.removeEventListener("online", handleOnline);
       window.removeEventListener("whatsapp-queue-updated", handleQueueUpdated);
       window.removeEventListener("platform-messages-updated", handlePlatformMessagesUpdated);
     };
