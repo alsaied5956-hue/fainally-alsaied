@@ -373,19 +373,17 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
       return;
     }
 
-    // 2. Prevent duplicate scan if student is already in the classroom presence list OR already recorded today
+    // 2. Prevent duplicate scan if student is already in the classroom presence list for this session
     const alreadyInQueue = (scanLogOrderRef.current || []).some(
       (b) => String(b).trim() === String(student.barcode).trim()
     );
-    const todayStatus = attendanceTodayRef.current?.[student.barcode];
-    const alreadyAttendedToday = todayStatus === "حضور" || todayStatus === "تأخير";
 
-    if ((alreadyInQueue || alreadyAttendedToday) && !overrideStatus) {
+    if (alreadyInQueue && !overrideStatus) {
       const existingIso = scanLogTimesRef.current?.[student.barcode];
       const existingTimeStr = existingIso
         ? new Date(existingIso).toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" })
         : "";
-      const existingStatus = todayStatus || "حضور";
+      const existingStatus = attendanceTodayRef.current?.[student.barcode] || "حضور";
       playBeep("warning");
       setScanAlert({
         type: "warning",
@@ -604,11 +602,9 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     groupStudents.forEach((student) => {
       const bCode = String(student.barcode).trim();
       const isPresentInQueue = queueBarcodeSet.has(bCode);
-      const todayStatus = attendanceToday?.[bCode];
-      const isAlreadyRecordedPresent = todayStatus === "حضور" || todayStatus === "تأخير";
 
-      if (!isPresentInQueue && !isAlreadyRecordedPresent) {
-        // الطالب مقيد بهذه المجموعة ولكنه لم يمر على الإسكانر ولم يسجل حضوره اليوم -> غائب
+      if (!isPresentInQueue) {
+        // الطالب مقيد بهذه المجموعة ولكنه لم يمر على الإسكانر في هذه الحصة -> غائب
         const msg =
           `تنبيه من منظومة الأستاذة إيمان الدمشيتي 📐\n` +
           `نفيدكم بعلم أن الطالب/ة: (${student.name})\n` +
@@ -617,8 +613,8 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
           `نرجو منكم المتابعة والاهتمام حرصاً على مستواه الدراسي وعدم تفويت المنهج.`;
         absentList.push({ student, message: msg, type: "غائب" });
       } else {
-        // الطالب مسجل حضور في طابور الحصة أو مسجل حضوره اليوم
-        const currentStatus = todayStatus || "حضور";
+        // الطالب مسجل حضور في طابور الحصة الحالية
+        const currentStatus = attendanceToday?.[student.barcode] || "حضور";
         const timeIso = scanLogTimes?.[student.barcode];
         const timeStr = timeIso
           ? new Date(timeIso).toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" })
@@ -793,15 +789,11 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
 
   const currentGroupScanned = useMemo(() => {
     const scanSet = new Set((scanLogOrder || []).map(b => String(b).trim()));
-    return currentGroupStudents.filter((s) => {
-      const b = String(s.barcode).trim();
-      const status = attendanceToday?.[b];
-      return scanSet.has(b) || status === "حضور" || status === "تأخير";
-    });
-  }, [currentGroupStudents, scanLogOrder, attendanceToday]);
+    return currentGroupStudents.filter((s) => scanSet.has(String(s.barcode).trim()));
+  }, [currentGroupStudents, scanLogOrder]);
 
   const currentGroupPresentCount = currentGroupScanned.filter(
-    (s) => attendanceToday?.[s.barcode] === "حضور" || !attendanceToday?.[s.barcode]
+    (s) => (attendanceToday?.[s.barcode] || "حضور") === "حضور"
   ).length;
 
   const currentGroupLateCount = currentGroupScanned.filter(
@@ -836,27 +828,11 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
 
   // Active Scanned list in the scanner table - strictly for the selected grade only
   const displayedBarcodes = useMemo(() => {
-    const fromOrder = (scanLogOrder || []).filter((barcode) => {
+    return (scanLogOrder || []).filter((barcode) => {
       const s = studentMap.get(String(barcode).trim());
       return s && s.groupGrade === selectedGrade;
     });
-
-    const set = new Set(fromOrder.map((b) => String(b).trim()));
-    const additional: string[] = [];
-
-    (students || []).forEach((s) => {
-      if (s.groupGrade === selectedGrade) {
-        const b = String(s.barcode).trim();
-        const status = attendanceToday?.[b];
-        if ((status === "حضور" || status === "تأخير") && !set.has(b)) {
-          set.add(b);
-          additional.push(b);
-        }
-      }
-    });
-
-    return [...fromOrder, ...additional];
-  }, [scanLogOrder, studentMap, selectedGrade, attendanceToday, students]);
+  }, [scanLogOrder, studentMap, selectedGrade]);
 
   const filteredBarcodes = useMemo(() => {
     if (!tableSearch.trim()) return displayedBarcodes;
