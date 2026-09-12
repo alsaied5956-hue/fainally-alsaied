@@ -761,14 +761,18 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
   }, [attendanceHistory]);
 
   // Students of the current group who attended in advance on the immediately preceding class date
+  // (Excluding students who are already scanned and present in today's room queue)
   const advanceAttendedStudents = useMemo(() => {
     if (!prevClassDateKey || !attendanceHistory?.[prevClassDateKey]) return [];
     const prevDateMap = attendanceHistory[prevClassDateKey] || {};
+    const queueBarcodeSet = new Set((scanLogOrder || []).map((b) => String(b).trim()));
     return currentGroupStudents.filter((s) => {
+      // If the student already scanned into the room today, they are present in person -> no advance compensation needed
+      if (queueBarcodeSet.has(String(s.barcode).trim())) return false;
       const st = prevDateMap[s.barcode];
       return st && (st.includes("حضور") || st.includes("تعويض") || st === "تأخير");
     });
-  }, [currentGroupStudents, prevClassDateKey, attendanceHistory]);
+  }, [currentGroupStudents, prevClassDateKey, attendanceHistory, scanLogOrder]);
 
   // Students of the SAME grade but OTHER days (available for makeup attendance)
   const otherDaysSameGradeStudents = useMemo(() => {

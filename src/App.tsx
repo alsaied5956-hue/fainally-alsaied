@@ -569,11 +569,13 @@ export default function App() {
     // If student was absent in the immediately preceding class date, mark that date as "حضور تعويضي"
     const prevClassDateKey = getImmediatelyPrecedingClassDate(todayKey, attendanceHistory);
     let updatedStudents = students;
+    let compensatedPreviousAbsence = false;
     if (prevClassDateKey && attendanceHistory[prevClassDateKey]?.[barcode] === "غائب") {
       updatedHistory[prevClassDateKey] = {
         ...(updatedHistory[prevClassDateKey] || {}),
         [barcode]: "حضور تعويضي",
       };
+      compensatedPreviousAbsence = true;
       // Compensated absence: reduce totalAbsentDays by 1
       updatedStudents = updatedStudents.map((s) => {
         if (s.barcode === barcode && (s.totalAbsentDays || 0) > 0) {
@@ -595,7 +597,7 @@ export default function App() {
     const prevStatus = attendanceToday[barcode];
     
     // Only update student record if attendance state actually newly increments and wasn't adjusted above
-    if (!prevStatus && !prevClassDateKey) {
+    if (!prevStatus && !compensatedPreviousAbsence) {
       updatedStudents = updatedStudents.map((s) => {
         if (s.barcode === barcode) {
           return {
@@ -690,11 +692,12 @@ export default function App() {
       }
     });
 
-    // 2. Also ensure makeup cross-day students are marked in today's attendance
+    // 2. Cross-day students (عكس أيام):
+    // They belong to their own group, NOT this group.
+    // Clean them out from today's group session records so groups stay 100% strictly independent.
     (crossDayList || []).forEach((item) => {
       const b = String(item.student.barcode).trim();
-      const currentSt = attendanceToday[b];
-      updatedToday[b] = currentSt?.includes("تأخير") ? "تأخير تعويضي" : "حضور تعويضي";
+      delete updatedToday[b];
     });
 
     const todayKey = getTodayKey();

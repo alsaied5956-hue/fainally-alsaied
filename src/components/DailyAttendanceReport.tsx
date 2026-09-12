@@ -33,12 +33,8 @@ export const DailyAttendanceReport: React.FC<DailyAttendanceReportProps> = ({
     const base = students.filter((s) => {
       if (filterGrade !== "ALL" && s.groupGrade !== filterGrade) return false;
       
-      // When filtering by days, include students of that days group OR any student who attended on this date as make-up
-      if (filterDays !== "ALL") {
-        const matchesGroupDays = s.groupDays === filterDays;
-        const attendedOnDate = Boolean(dateAttendanceMap[s.barcode]);
-        if (!matchesGroupDays && !attendedOnDate) return false;
-      }
+      // Strict separation: each group is completely independent
+      if (filterDays !== "ALL" && s.groupDays !== filterDays) return false;
 
       // Status filter
       if (filterStatus !== "ALL") {
@@ -246,19 +242,12 @@ export const DailyAttendanceReport: React.FC<DailyAttendanceReportProps> = ({
                   else if (status === "تأخير") statusBg = "bg-amber-500/20 text-amber-300 border-amber-500/40";
                   else if (status === "غائب") statusBg = "bg-rose-500/20 text-rose-300 border-rose-500/40";
 
-                  const isCrossDayStudent = filterDays !== "ALL" && student.groupDays !== filterDays;
-
                   return (
                     <tr key={student.barcode} className="hover:bg-indigo-500/10 transition-colors font-medium">
                       <td className="p-3.5 font-mono text-slate-400">{idx + 1}</td>
                       <td className="p-3.5 font-mono text-amber-300 font-bold">{student.barcode}</td>
                       <td className="p-3.5 font-bold text-slate-100">
                         <span>{student.name}</span>
-                        {isCrossDayStudent && (
-                          <span className="block text-[10px] text-sky-400 font-normal">
-                            مقيد بمجموعة: ({student.groupDays}) - حضر تعويضاً
-                          </span>
-                        )}
                       </td>
                       <td className="p-3.5 text-slate-300">{student.groupGrade}</td>
                       <td className="p-3.5 text-slate-400">{student.groupDays}</td>
