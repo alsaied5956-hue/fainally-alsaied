@@ -35,6 +35,8 @@ import { DeviceApiIntegrationView } from "./DeviceApiIntegrationView";
 import {
   syncAndMergeAllDevicesData,
   exportCompleteBackupJSON,
+  downloadBackupFromServer,
+  copyBackupJSONToClipboard,
   importAndMergeCompleteBackupJSON,
   getCloudDiagnostics,
   CloudDiagnosticsInfo,
@@ -284,15 +286,33 @@ export const MultiDeviceSyncModal: React.FC<MultiDeviceSyncModalProps> = ({
       exportCompleteBackupJSON();
       setFeedback({
         type: "info",
-        title: "💾 تم تنزيل ملف النسخة الاحتياطية الشاملة!",
+        title: "💾 بدأ تنزيل ملف النسخة الاحتياطية الموحدة!",
         message:
-          "تم حفظ ملف النسخة الاحتياطية على جهازك. يمكنك الآن نقله (عبر واتساب أو فلاشة) واستيراده في أي جهاز آخر لدمج الطلاب مباشرة حتى بدون إنترنت.",
+          "إذا لم يبدأ التنزيل تلقائياً في متصفحك، اضغط على زر 'تحميل مباشر من السيرفر' بالأسفل.",
       });
     } catch (e: any) {
+      downloadBackupFromServer();
+      setFeedback({
+        type: "info",
+        title: "💾 جاري التحميل المباشر من السيرفر",
+        message: "تم بدء تنزيل النسخة الاحتياطية مباشرة من السيرفر.",
+      });
+    }
+  };
+
+  const handleCopyBackup = async () => {
+    const success = await copyBackupJSONToClipboard();
+    if (success) {
+      setFeedback({
+        type: "success",
+        title: "📋 تم نسخ النسخة الاحتياطية بنجاح!",
+        message: "تم نسخ بيانات السنتر بالكامل إلى الحافظة. يمكنك لصقها في أي مكان.",
+      });
+    } else {
       setFeedback({
         type: "error",
-        title: "فشل التصدير",
-        message: e?.message || "تعذر تصدير الملف.",
+        title: "فشل النسخ",
+        message: "يرجى الضغط على زر تصدير النسخة الاحتياطية للتحميل.",
       });
     }
   };
@@ -1056,6 +1076,26 @@ export const MultiDeviceSyncModal: React.FC<MultiDeviceSyncModalProps> = ({
                       <span>📥 استيراد ودمج ملف نسخة احتياطية من جهاز آخر</span>
                     </button>
                   </div>
+                </div>
+
+                {/* Additional Direct Download / Copy Options */}
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-slate-700/50 text-[11px]">
+                  <a
+                    href="/api/backup/download"
+                    download
+                    className="inline-flex items-center gap-1.5 text-amber-400 hover:text-amber-300 underline font-semibold transition-colors"
+                  >
+                    <DownloadCloud className="w-3.5 h-3.5" />
+                    <span>تحميل مباشر من السيرفر (إذا لم يبدأ التنزيل تلقائياً)</span>
+                  </a>
+
+                  <button
+                    type="button"
+                    onClick={handleCopyBackup}
+                    className="inline-flex items-center gap-1.5 text-slate-400 hover:text-white transition-colors cursor-pointer"
+                  >
+                    <span>📋 نسخ النسخة الاحتياطية كنص للحافظة</span>
+                  </button>
                 </div>
               </div>
 

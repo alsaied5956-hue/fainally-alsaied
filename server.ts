@@ -1,6 +1,9 @@
 import express, { Request, Response, NextFunction } from "express";
 import path from "path";
 import fs from "fs";
+import zlib from "zlib";
+import { initializeApp, getApps } from "firebase/app";
+import { getFirestore, doc, getDoc, setDoc, onSnapshot } from "firebase/firestore";
 import { createServer as createViteServer } from "vite";
 import {
   analyzeStudentPerformance,
@@ -164,6 +167,109 @@ try {
 } catch (e) {
   console.warn("[Sync Hub] State initialization note:", e);
 }
+
+// -------------------------------------------------------------
+// Firebase Firestore Live Bridge for 100% Cross-Device Unification
+// -------------------------------------------------------------
+let serverFirestoreDb: any = null;
+
+function initServerFirestore() {
+  if (serverFirestoreDb) return serverFirestoreDb;
+  try {
+    const configPath = path.join(process.cwd(), "firebase-applet-config.json");
+    if (fs.existsSync(configPath)) {
+      const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+      const app = getApps().length === 0 ? initializeApp(config) : getApps()[0];
+      serverFirestoreDb = getFirestore(app, config.firestoreDatabaseId);
+      console.log("[Sync Hub] Initialized Firebase Firestore server bridge");
+      return serverFirestoreDb;
+    }
+  } catch (err) {
+    console.warn("[Sync Hub] Failed to initialize Firestore bridge:", err);
+  }
+  return null;
+}
+
+function decompressCloudPayload(compressedString: string): any {
+  if (!compressedString || typeof compressedString !== "string") return null;
+  try {
+    if (compressedString.startsWith("RAW:")) {
+      return JSON.parse(compressedString.slice(4));
+    }
+    const b64 = compressedString.startsWith("GZIP:") ? compressedString.slice(5) : compressedString;
+    const buf = Buffer.from(b64, "base64");
+    const decompressed = zlib.gunzipSync(buf);
+    return JSON.parse(decompressed.toString("utf-8"));
+  } catch (err) {
+    console.error("[Sync Hub] Error decompressing cloud payload:", err);
+    return null;
+  }
+}
+
+function compressCloudPayload(data: any): string {
+  try {
+    const jsonStr = JSON.stringify(data);
+    const compressed = zlib.gzipSync(Buffer.from(jsonStr, "utf-8"));
+    return "GZIP:" + compressed.toString("base64");
+  } catch (err) {
+    console.error("[Sync Hub] Error compressing payload:", err);
+    return "RAW:" + JSON.stringify(data);
+  }
+}
+
+async function syncServerWithFirestore() {
+  const db = initServerFirestore();
+  if (!db) return;
+
+  try {
+    const docRef = doc(db, "system_state", "main_center_data");
+    const snap = await getDoc(docRef);
+    if (snap.exists()) {
+      const d = snap.data();
+      if (d._compressedPayload) {
+        const decompressed = decompressCloudPayload(d._compressedPayload);
+        if (decompressed && Array.isArray(decompressed.students)) {
+          cachedServerState = decompressed;
+          lastServerUpdate = d.updatedAt || Date.now();
+          fs.writeFileSync(SYNC_STATE_FILE, JSON.stringify(decompressed), "utf-8");
+          console.log(`[Sync Hub] Synced from Firestore successfully (${decompressed.students.length} students)`);
+        }
+      }
+    }
+
+    // Subscribe to continuous real-time changes from Firestore
+    onSnapshot(
+      docRef,
+      (snapshot) => {
+        if (!snapshot.exists()) return;
+        const d = snapshot.data();
+        if (d._compressedPayload && d.updatedAt && d.updatedAt > lastServerUpdate) {
+          const decompressed = decompressCloudPayload(d._compressedPayload);
+          if (decompressed && Array.isArray(decompressed.students)) {
+            cachedServerState = decompressed;
+            lastServerUpdate = d.updatedAt;
+            fs.writeFileSync(SYNC_STATE_FILE, JSON.stringify(decompressed), "utf-8");
+            broadcastToUnified({
+              type: "state_update",
+              sourceDeviceId: d._lastClientId || "firestore_cloud",
+              updatedAt: lastServerUpdate,
+              data: decompressed,
+            });
+            console.log(`[Sync Hub] Received cloud broadcast from Firestore (${decompressed.students.length} students)`);
+          }
+        }
+      },
+      (err) => {
+        console.warn("[Sync Hub] Firestore snapshot listener warning:", err?.message);
+      }
+    );
+  } catch (err) {
+    console.warn("[Sync Hub] Firestore initialization sync error:", err);
+  }
+}
+
+// Trigger initial cloud sync in background
+syncServerWithFirestore().catch(() => {});
 
 async function startServer() {
   const app = express();
@@ -341,11 +447,53 @@ async function startServer() {
       data,
     });
 
+    // Mirror asynchronously to Cloud Firestore so all external platforms stay 100% unified
+    if (serverFirestoreDb) {
+      try {
+        const compressedPayload = compressCloudPayload(data);
+        const docRef = doc(serverFirestoreDb, "system_state", "main_center_data");
+        setDoc(
+          docRef,
+          {
+            _compressedPayload: compressedPayload,
+            studentsCount: Array.isArray(data.students) ? data.students.length : 0,
+            paymentsCount: Object.values(data.payments || {}).reduce(
+              (acc: number, m: any) => acc + Object.keys(m || {}).length,
+              0
+            ),
+            updatedAt: lastServerUpdate,
+            _lastClientId: sourceDeviceId || "server_sync_hub",
+            syncedAtIso: new Date().toISOString(),
+          },
+          { merge: true }
+        ).catch((e) => console.warn("[Sync Hub] Background Firestore write warning:", e?.message));
+      } catch (e: any) {
+        console.warn("[Sync Hub] Firestore mirror compression note:", e?.message);
+      }
+    }
+
     res.json({
       ok: true,
       updatedAt: lastServerUpdate,
       broadcastedToClients: sseSubscribers.size,
     });
+  });
+
+  // Direct HTTP attachment download for complete JSON backup (Guaranteed download on all devices & iframes)
+  app.get(["/api/backup/download", "/api/sync/backup"], (_req: Request, res: Response) => {
+    try {
+      const data =
+        cachedServerState ||
+        (fs.existsSync(SYNC_STATE_FILE)
+          ? JSON.parse(fs.readFileSync(SYNC_STATE_FILE, "utf-8"))
+          : JSON.parse(fs.readFileSync(BACKUP_FALLBACK_FILE, "utf-8")));
+      const dateStr = new Date().toISOString().slice(0, 10);
+      res.setHeader("Content-Disposition", `attachment; filename="center_backup_${dateStr}.json"`);
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.send(JSON.stringify(data, null, 2));
+    } catch (e: any) {
+      res.status(500).json({ ok: false, error: e?.message || "Failed to generate backup file" });
+    }
   });
 
   // 5. Consolidated Entry & Exit Journal (All Devices Aggregated)

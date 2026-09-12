@@ -136,14 +136,15 @@ export const DEFAULT_USERS: UserAccount[] = [
   },
 ];
 
-const seedBackupStudents = Array.isArray(centerBackup?.students) ? (centerBackup.students as Student[]) : [];
-const seedBackupHistory = (centerBackup?.attendanceHistory as Record<string, Record<string, string>>) || {};
-const seedBackupToday = (centerBackup?.attendanceToday as Record<string, string>) || {};
-const seedBackupPrices = (centerBackup?.groupPrices as Record<string, number>) || {};
-const seedBackupUsers = Array.isArray(centerBackup?.usersList) && centerBackup.usersList.length > 0
-  ? (centerBackup.usersList as UserAccount[])
+const hydratedSeedBackup = hydrateSystemPayload<any>(centerBackup);
+const seedBackupStudents = Array.isArray(hydratedSeedBackup?.students) ? (hydratedSeedBackup.students as Student[]) : [];
+const seedBackupHistory = (hydratedSeedBackup?.attendanceHistory as Record<string, Record<string, string>>) || {};
+const seedBackupToday = (hydratedSeedBackup?.attendanceToday as Record<string, string>) || {};
+const seedBackupPrices = (hydratedSeedBackup?.groupPrices as Record<string, number>) || {};
+const seedBackupUsers = Array.isArray(hydratedSeedBackup?.usersList) && hydratedSeedBackup.usersList.length > 0
+  ? (hydratedSeedBackup.usersList as UserAccount[])
   : DEFAULT_USERS;
-const seedBackupPayments = normalizeAndMigratePayments(centerBackup?.payments);
+const seedBackupPayments = normalizeAndMigratePayments(hydratedSeedBackup?.payments);
 
 export const INITIAL_SYSTEM_DATA: SystemData = {
   students: seedBackupStudents,
@@ -1257,90 +1258,85 @@ export function mergeCloudDataWithLocal(local: SystemData, cloud: Partial<System
 
   const normalizeName = (name: string) => (name || "").trim().toLowerCase().replace(/\s+/g, " ");
 
-  // Seed with local students, excluding any deleted barcodes
-  (local.students || []).forEach((s) => {
-    if (s?.barcode) {
-      const bKey = String(s.barcode).trim();
-      if (deletedSet.has(bKey)) return;
-      studentMap.set(bKey, { ...s });
-      const normName = normalizeName(s.name);
-      if (normName) {
-        nameToBarcodeMap.set(`${normName}_${s.groupGrade}`, bKey);
-      }
-    }
-  });
-
-  // Check if local student database was explicitly cleared on this machine
+  const isCloudNewer = cloudTime > localTime;
   const isLocalExplicitlyEmpty = (local.students?.length === 0 && (local.deletedBarcodes?.length || 0) > 0);
 
-  // Merge remote students from cloud without ever dropping any student!
-  if (Array.isArray(cloud.students) && !isLocalExplicitlyEmpty) {
+  if (isCloudNewer && Array.isArray(cloud.students) && cloud.students.length > 0) {
+    // CLOUD IS MORE RECENT: Cloud is authoritative source of truth!
     cloud.students.forEach((remoteStudent) => {
       if (!remoteStudent?.barcode) return;
       const bKey = String(remoteStudent.barcode).trim();
-      if (deletedSet.has(bKey)) return; // Never resurrect deleted students!
-
+      if (deletedSet.has(bKey)) return;
+      studentMap.set(bKey, { ...remoteStudent });
       const normName = normalizeName(remoteStudent.name);
-      const nameKey = `${normName}_${remoteStudent.groupGrade}`;
-
-      let existingKey = bKey;
-      if (!studentMap.has(bKey) && normName && nameToBarcodeMap.has(nameKey)) {
-        existingKey = nameToBarcodeMap.get(nameKey)!;
-      }
-
-      const existing = studentMap.get(existingKey);
-      if (!existing) {
-        // Safe addition: retain remote student created on any other device
-        studentMap.set(bKey, { ...remoteStudent });
-        if (normName) {
-          nameToBarcodeMap.set(nameKey, bKey);
-        }
-      } else {
-        // Merge student properties intelligently with CRDT union rules
-        const localScores = Array.isArray(existing.totalExamScores) ? existing.totalExamScores : [];
-        const remoteScores = Array.isArray(remoteStudent.totalExamScores) ? remoteStudent.totalExamScores : [];
-        const mergedScores = Array.from(new Set([...localScores, ...remoteScores]));
-
-        const points = Math.max(existing.points || 0, remoteStudent.points || 0);
-        const totalAttendanceDays = Math.max(existing.totalAttendanceDays || 0, remoteStudent.totalAttendanceDays || 0);
-        const totalAbsentDays = Math.max(existing.totalAbsentDays || 0, remoteStudent.totalAbsentDays || 0);
-
-        const isCloudNewer = cloudTime > localTime;
-        const baseStudent = isCloudNewer ? { ...existing, ...remoteStudent } : { ...remoteStudent, ...existing };
-        const phone = (isCloudNewer ? remoteStudent.phone : existing.phone) || remoteStudent.phone || existing.phone || "";
-        const parentPhone = (isCloudNewer ? remoteStudent.parentPhone : existing.parentPhone) || remoteStudent.parentPhone || existing.parentPhone || "";
-        const notes = (isCloudNewer ? remoteStudent.notes : existing.notes) || remoteStudent.notes || existing.notes || "";
-        const groupDays = (isCloudNewer ? remoteStudent.groupDays : existing.groupDays) || remoteStudent.groupDays || existing.groupDays;
-        const discountReason = (isCloudNewer ? remoteStudent.discountReason : existing.discountReason) || remoteStudent.discountReason || existing.discountReason;
-        const customMonthlyFee = isCloudNewer
-          ? (remoteStudent.customMonthlyFee !== undefined ? remoteStudent.customMonthlyFee : existing.customMonthlyFee)
-          : (existing.customMonthlyFee !== undefined ? existing.customMonthlyFee : remoteStudent.customMonthlyFee);
-        const name = (isCloudNewer ? remoteStudent.name : existing.name) || remoteStudent.name || existing.name;
-        const groupGrade = (isCloudNewer ? remoteStudent.groupGrade : existing.groupGrade) || remoteStudent.groupGrade || existing.groupGrade;
-
-        const lastExamTitle = (localTime >= cloudTime ? existing.lastExamTitle : remoteStudent.lastExamTitle) || existing.lastExamTitle || remoteStudent.lastExamTitle || "";
-        const lastExamScore = (localTime >= cloudTime ? existing.lastExamScore : remoteStudent.lastExamScore) || existing.lastExamScore || remoteStudent.lastExamScore || "";
-
-        studentMap.set(existingKey, {
-          ...baseStudent,
-          name,
-          groupGrade,
-          barcode: existing.barcode || remoteStudent.barcode,
-          phone,
-          parentPhone,
-          notes,
-          groupDays,
-          discountReason,
-          customMonthlyFee,
-          points,
-          totalAttendanceDays,
-          totalAbsentDays,
-          totalExamScores: mergedScores.length > 0 ? mergedScores : (localScores.length > 0 ? localScores : remoteScores),
-          lastExamTitle,
-          lastExamScore,
-        });
+      if (normName) {
+        nameToBarcodeMap.set(`${normName}_${remoteStudent.groupGrade}`, bKey);
       }
     });
+
+    // Only add local students if they were created LOCALLY after cloudTime (offline creation on this device)
+    if (!isLocalExplicitlyEmpty && Array.isArray(local.students)) {
+      local.students.forEach((localStudent) => {
+        if (!localStudent?.barcode) return;
+        const bKey = String(localStudent.barcode).trim();
+        if (deletedSet.has(bKey)) return;
+        if (!studentMap.has(bKey)) {
+          const createdAt = parseTimestamp(localStudent.createdAt);
+          if (createdAt > cloudTime) {
+            studentMap.set(bKey, { ...localStudent });
+          }
+        }
+      });
+    }
+  } else {
+    // LOCAL IS NEWER OR EQUAL: Local is authoritative base, add missing remote students
+    (local.students || []).forEach((s) => {
+      if (s?.barcode) {
+        const bKey = String(s.barcode).trim();
+        if (deletedSet.has(bKey)) return;
+        studentMap.set(bKey, { ...s });
+        const normName = normalizeName(s.name);
+        if (normName) {
+          nameToBarcodeMap.set(`${normName}_${s.groupGrade}`, bKey);
+        }
+      }
+    });
+
+    if (Array.isArray(cloud.students) && !isLocalExplicitlyEmpty) {
+      cloud.students.forEach((remoteStudent) => {
+        if (!remoteStudent?.barcode) return;
+        const bKey = String(remoteStudent.barcode).trim();
+        if (deletedSet.has(bKey)) return;
+
+        const normName = normalizeName(remoteStudent.name);
+        const nameKey = `${normName}_${remoteStudent.groupGrade}`;
+
+        let existingKey = bKey;
+        if (!studentMap.has(bKey) && normName && nameToBarcodeMap.has(nameKey)) {
+          existingKey = nameToBarcodeMap.get(nameKey)!;
+        }
+
+        const existing = studentMap.get(existingKey);
+        if (!existing) {
+          studentMap.set(bKey, { ...remoteStudent });
+          if (normName) {
+            nameToBarcodeMap.set(nameKey, bKey);
+          }
+        } else {
+          // Merge student properties intelligently
+          const localScores = Array.isArray(existing.totalExamScores) ? existing.totalExamScores : [];
+          const remoteScores = Array.isArray(remoteStudent.totalExamScores) ? remoteStudent.totalExamScores : [];
+          const mergedScores = Array.from(new Set([...localScores, ...remoteScores]));
+
+          studentMap.set(existingKey, {
+            ...existing,
+            ...remoteStudent,
+            ...existing, // local takes precedence
+            totalExamScores: mergedScores.length > 0 ? mergedScores : (localScores.length > 0 ? localScores : remoteScores),
+          });
+        }
+      });
+    }
   }
 
   const mergedStudents = Array.from(studentMap.values());
@@ -1813,18 +1809,76 @@ export async function exportPaidStudentsToCloud(): Promise<{
  * Export Complete Unified JSON Backup file for offline cross-device transfer
  */
 export function exportCompleteBackupJSON(): void {
-  const data = loadLocalData();
-  const jsonStr = JSON.stringify(data, null, 2);
-  const blob = new Blob([jsonStr], { type: "application/json;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
+  try {
+    const data = loadLocalData();
+    const jsonStr = JSON.stringify(data, null, 2);
+    const blob = new Blob([jsonStr], { type: "application/json;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    const dateStr = new Date().toISOString().slice(0, 10);
+    link.href = url;
+    link.setAttribute("download", `center_backup_${dateStr}.json`);
+    link.style.display = "none";
+    document.body.appendChild(link);
+    link.click();
+    setTimeout(() => {
+      try {
+        if (document.body.contains(link)) {
+          document.body.removeChild(link);
+        }
+        URL.revokeObjectURL(url);
+      } catch {}
+    }, 60000);
+  } catch (err) {
+    console.warn("Client blob download failed, falling back to direct server download:", err);
+    downloadBackupFromServer();
+  }
+}
+
+/**
+ * Direct HTTP attachment download from server (Works seamlessly in restricted iframes and mobile webviews)
+ */
+export function downloadBackupFromServer(): void {
   const dateStr = new Date().toISOString().slice(0, 10);
-  link.href = url;
-  link.setAttribute("download", `سنتر_نسخة_احتياطية_شاملة_${dateStr}.json`);
+  const link = document.createElement("a");
+  link.href = "/api/backup/download";
+  link.setAttribute("download", `center_backup_${dateStr}.json`);
+  link.target = "_blank";
+  link.style.display = "none";
   document.body.appendChild(link);
   link.click();
-  document.body.removeChild(link);
-  URL.revokeObjectURL(url);
+  setTimeout(() => {
+    try {
+      if (document.body.contains(link)) {
+        document.body.removeChild(link);
+      }
+    } catch {}
+  }, 2000);
+}
+
+/**
+ * Copy entire system backup JSON directly to clipboard as an instant zero-download backup
+ */
+export async function copyBackupJSONToClipboard(): Promise<boolean> {
+  try {
+    const data = loadLocalData();
+    const jsonStr = JSON.stringify(data, null, 2);
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(jsonStr);
+      return true;
+    }
+    const textArea = document.createElement("textarea");
+    textArea.value = jsonStr;
+    textArea.style.position = "fixed";
+    textArea.style.left = "-9999px";
+    document.body.appendChild(textArea);
+    textArea.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(textArea);
+    return ok;
+  } catch {
+    return false;
+  }
 }
 
 /**
