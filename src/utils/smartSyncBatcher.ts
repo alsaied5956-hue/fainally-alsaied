@@ -102,7 +102,11 @@ function startAutoFlushSchedule() {
 function persistQueueLocally() {
   if (typeof window === "undefined") return;
   try {
-    localStorage.setItem(STORAGE_QUEUE_KEY, JSON.stringify(inMemoryQueue));
+    if (typeof navigator !== "undefined" && !navigator.onLine && inMemoryQueue.length > 0) {
+      localStorage.setItem(STORAGE_QUEUE_KEY, JSON.stringify(inMemoryQueue));
+    } else {
+      localStorage.removeItem(STORAGE_QUEUE_KEY);
+    }
   } catch {}
 }
 

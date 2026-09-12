@@ -1230,7 +1230,9 @@ export function syncDataToCloud(data: SystemData, immediate: boolean = false): v
   );
 
   if (typeof window !== "undefined") {
-    localStorage.setItem(PENDING_SYNC_KEY, "true");
+    if (!navigator.onLine) {
+      localStorage.setItem(PENDING_SYNC_KEY, "true");
+    }
     notifySyncStatusChange();
   }
 
