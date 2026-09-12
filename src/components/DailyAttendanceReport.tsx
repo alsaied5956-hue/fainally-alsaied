@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from "react";
 import { Student, GradeName, GroupDays, GRADE_ORDER } from "../types";
-import { getTodayKey, openWhatsApp, sortStudentsByGradeAndName } from "../utils/helpers";
+import { getTodayKey, openWhatsApp, sortStudentsByGradeAndName, normalizeAttendanceStatus } from "../utils/helpers";
 import { matchStudentSearch } from "../utils/search";
 import { exportAttendanceHistoryToExcel } from "../utils/excel";
 import { Calendar, Filter, FileSpreadsheet, FileText, CheckCircle2, AlertTriangle, XCircle, Edit3, Search, X } from "lucide-react";
@@ -38,7 +38,8 @@ export const DailyAttendanceReport: React.FC<DailyAttendanceReportProps> = ({
 
       // Status filter
       if (filterStatus !== "ALL") {
-        const st = dateAttendanceMap[s.barcode] || "لم يسجل";
+        const rawSt = dateAttendanceMap[s.barcode];
+        const st = rawSt !== undefined ? normalizeAttendanceStatus(rawSt) : "لم يسجل";
         if (filterStatus === "حضور تعويضي") {
           if (!st.includes("تعويض")) return false;
         } else if (st !== filterStatus) {
@@ -71,8 +72,10 @@ export const DailyAttendanceReport: React.FC<DailyAttendanceReportProps> = ({
     let makeup = 0;
 
     filteredStudents.forEach((s) => {
-      const st = dateAttendanceMap[s.barcode];
-      if (st?.includes("تعويض")) makeup++;
+      const rawSt = dateAttendanceMap[s.barcode];
+      if (rawSt === undefined || rawSt === null || rawSt === "") return;
+      const st = normalizeAttendanceStatus(rawSt);
+      if (st.includes("تعويض")) makeup++;
       else if (st === "حضور") present++;
       else if (st === "تأخير") late++;
       else if (st === "غائب") absent++;
@@ -234,7 +237,10 @@ export const DailyAttendanceReport: React.FC<DailyAttendanceReportProps> = ({
                 </tr>
               ) : (
                 filteredStudents.map((student, idx) => {
-                  const status = dateAttendanceMap[student.barcode] || "لم يسجل";
+                  const rawStatus = dateAttendanceMap[student.barcode];
+                  const status = rawStatus !== undefined && rawStatus !== null && rawStatus !== ""
+                    ? normalizeAttendanceStatus(rawStatus)
+                    : "لم يسجل";
                   let statusBg = "bg-slate-800 text-slate-400 border-slate-700";
                   const isMakeup = status.includes("تعويض");
                   if (isMakeup) statusBg = "bg-sky-500/20 text-sky-300 border-sky-500/50 font-black";

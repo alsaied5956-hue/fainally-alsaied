@@ -45,6 +45,7 @@ import {
   isStudentPaid,
   getImmediatelyPrecedingClassDate,
   getArabicDayName,
+  normalizeAttendanceStatus,
 } from "./utils/helpers";
 import {
   subscribeToGroupFinished,
@@ -570,7 +571,7 @@ export default function App() {
     const prevClassDateKey = getImmediatelyPrecedingClassDate(todayKey, attendanceHistory);
     let updatedStudents = students;
     let compensatedPreviousAbsence = false;
-    if (prevClassDateKey && attendanceHistory[prevClassDateKey]?.[barcode] === "غائب") {
+    if (prevClassDateKey && normalizeAttendanceStatus(attendanceHistory[prevClassDateKey]?.[barcode]) === "غائب") {
       updatedHistory[prevClassDateKey] = {
         ...(updatedHistory[prevClassDateKey] || {}),
         [barcode]: "حضور تعويضي",
@@ -946,7 +947,8 @@ export default function App() {
     const todayKey = getTodayKey();
     const isToday = dateKey === todayKey;
     
-    const prevStatus = isToday ? attendanceToday[barcode] : (attendanceHistory[dateKey]?.[barcode]);
+    const rawPrevStatus = isToday ? attendanceToday[barcode] : attendanceHistory[dateKey]?.[barcode];
+    const prevStatus = normalizeAttendanceStatus(rawPrevStatus);
     if (prevStatus === newStatus) return;
 
     const dateMap = attendanceHistory[dateKey] || {};

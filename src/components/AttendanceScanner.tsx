@@ -14,6 +14,7 @@ import {
   getTodayKey,
   getImmediatelyPrecedingClassDate,
   getArabicDayName,
+  normalizeAttendanceStatus,
 } from "../utils/helpers";
 import { playBeep, speakArabicGreeting } from "../utils/audio";
 import { StudentSearchBox } from "./StudentSearchBox";
@@ -579,8 +580,9 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
 
       if (!isPresentInQueue) {
         // فحص ما إذا كان الطالب قد حضر تعويضاً في اليوم السابق مباشرة
-        const prevStatus = prevDateRecords[bCode];
-        const attendedInAdvance = prevStatus && (prevStatus.includes("حضور") || prevStatus.includes("تعويض") || prevStatus === "تأخير");
+        const rawPrevStatus = prevDateRecords[bCode];
+        const prevStatus = normalizeAttendanceStatus(rawPrevStatus);
+        const attendedInAdvance = Boolean(prevStatus && (prevStatus.includes("حضور") || prevStatus.includes("تعويض") || prevStatus === "تأخير"));
 
         if (attendedInAdvance) {
           advanceCompensationList.push({
@@ -769,8 +771,9 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     return currentGroupStudents.filter((s) => {
       // If the student already scanned into the room today, they are present in person -> no advance compensation needed
       if (queueBarcodeSet.has(String(s.barcode).trim())) return false;
-      const st = prevDateMap[s.barcode];
-      return st && (st.includes("حضور") || st.includes("تعويض") || st === "تأخير");
+      const rawSt = prevDateMap[s.barcode];
+      const st = normalizeAttendanceStatus(rawSt);
+      return Boolean(st && (st.includes("حضور") || st.includes("تعويض") || st === "تأخير"));
     });
   }, [currentGroupStudents, prevClassDateKey, attendanceHistory, scanLogOrder]);
 

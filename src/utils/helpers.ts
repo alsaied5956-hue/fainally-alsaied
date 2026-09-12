@@ -114,6 +114,33 @@ export function getImmediatelyPrecedingClassDate(
   }
 }
 
+/**
+ * Normalizes any attendance status value (number code 1-6, string, object, or null/undefined)
+ * into a guaranteed standard string ("حضور", "غائب", "تأخير", "حضور تعويضي", "تأخير تعويضي", "إذن", or "").
+ * Prevents "TypeError: st?.includes is not a function" when st is a number or non-string.
+ */
+export function normalizeAttendanceStatus(val: unknown): string {
+  if (val === null || val === undefined) return "";
+  if (typeof val === "number" || (typeof val === "string" && /^[1-6]$/.test(val.trim()))) {
+    const code = Number(val);
+    switch (code) {
+      case 1: return "حضور";
+      case 2: return "غائب";
+      case 3: return "تأخير";
+      case 4: return "إذن";
+      case 5: return "حضور تعويضي";
+      case 6: return "تأخير تعويضي";
+      default: return String(val);
+    }
+  }
+  if (typeof val === "object") {
+    const obj = val as Record<string, unknown>;
+    if (obj.status) return normalizeAttendanceStatus(obj.status);
+    return "";
+  }
+  return String(val);
+}
+
 // Convert Arabic digits to English, remove non-digits, and normalize Egypt WhatsApp
 export function cleanPhoneNumber(phone?: string): string {
   if (!phone) return "";

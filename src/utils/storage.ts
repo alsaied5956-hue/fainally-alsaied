@@ -13,7 +13,7 @@ import {
 import { DEFAULT_GRADE_PRICES, getTodayKey, formatTimeArabic } from "./helpers";
 import { db, ensureFirebaseAuth } from "./firebase";
 import { doc, setDoc, getDoc, onSnapshot, writeBatch } from "firebase/firestore";
-import { compressData, decompressData, compactSystemPayload, hydrateSystemPayload } from "./compression";
+import { compressData, decompressData, compactSystemPayload, hydrateSystemPayload, hydrateHistory, hydrateAttendanceMap } from "./compression";
 import { saveSnapshotToIndexedDB, loadSnapshotFromIndexedDB } from "./indexedDB";
 import {
   isBulkSyncActive,
@@ -516,11 +516,16 @@ export function loadLocalData(): SystemData {
 
     const loaded: SystemData = {
       students: finalStudents,
-      attendanceHistory: {
+      attendanceHistory: hydrateHistory({
         ...backupHistory,
         ...(parsed.attendanceHistory || {}),
-      },
-      attendanceToday: parsed.attendanceHistory?.[todayKey] || (parsed.attendanceToday && Object.keys(parsed.attendanceToday).some(b => filteredScanTimes[b]) ? parsed.attendanceToday : {}),
+      }),
+      attendanceToday: hydrateAttendanceMap(
+        parsed.attendanceHistory?.[todayKey] ||
+          (parsed.attendanceToday && Object.keys(parsed.attendanceToday).some((b) => filteredScanTimes[b])
+            ? parsed.attendanceToday
+            : {})
+      ),
       scanLogTimes: filteredScanTimes,
       payments: mergedPayments,
       scanLogOrder: initialScanOrder,
@@ -648,10 +653,10 @@ export async function hydrateFromIndexedDB(): Promise<void> {
         snapshot.students && snapshot.students.length > 0 && snapUpdated >= currUpdated
           ? snapshot.students
           : currentLocal.students,
-      attendanceHistory: {
+      attendanceHistory: hydrateHistory({
         ...(snapshot.attendanceHistory || {}),
         ...(currentLocal.attendanceHistory || {}),
-      },
+      }),
       payments: {
         ...(snapshot.payments || {}),
         ...(currentLocal.payments || {}),
