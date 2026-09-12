@@ -213,11 +213,32 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     time: string;
   } | null>(null);
 
-  // Keep latest references for callbacks without re-subscribing
+  // Keep latest references for callbacks and high-throughput scanning without re-subscribing or race conditions
   const studentsRef = useRef(students);
   studentsRef.current = students;
   const onRecordAttendanceRef = useRef(onRecordAttendance);
   onRecordAttendanceRef.current = onRecordAttendance;
+  const studentMapRef = useRef(studentMap);
+  studentMapRef.current = studentMap;
+  const selectedGradeRef = useRef(selectedGrade);
+  selectedGradeRef.current = selectedGrade;
+  const selectedDaysRef = useRef(selectedDays);
+  selectedDaysRef.current = selectedDays;
+  const scanDirectionModeRef = useRef(scanDirectionMode);
+  scanDirectionModeRef.current = scanDirectionMode;
+  const activeSessionSlotIdRef = useRef(activeSessionSlotId);
+  activeSessionSlotIdRef.current = activeSessionSlotId;
+  const scanLogOrderRef = useRef(scanLogOrder || []);
+  scanLogOrderRef.current = scanLogOrder || [];
+  const scanLogTimesRef = useRef(scanLogTimes || {});
+  scanLogTimesRef.current = scanLogTimes || {};
+  const attendanceTodayRef = useRef(attendanceToday || {});
+  attendanceTodayRef.current = attendanceToday || {};
+  const paymentsRef = useRef(payments || {});
+  paymentsRef.current = payments || {};
+  const voiceEnabledRef = useRef(voiceEnabled);
+  voiceEnabledRef.current = voiceEnabled;
+  const lastScannedDedupeRef = useRef<{ code: string; time: number }>({ code: "", time: 0 });
   const processedScansSet = useRef(new Set<string>());
 
   // ⚡ Diagnostic Ping Test: Test Realtime Connection and Latency Across All Devices
@@ -336,29 +357,35 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
   ) => {
     setFinishedBanner(null);
 
+    const targetGrade = selectedGradeRef.current;
+    const targetDays = selectedDaysRef.current;
+
     // 1. Strict Grade validation: MUST BE THE EXACT SAME GRADE
     // وميدخلش غير الطلاب الي من نفس الصف الدراسي
-    if (student.groupGrade !== selectedGrade) {
+    if (student.groupGrade !== targetGrade) {
       playBeep("error");
       setScanAlert({
         type: "error",
         title: "🚫 غير مسموح: طالب من صف دراسي مختلف!",
-        message: `الطالب (${student.name}) مقيد في [${student.groupGrade}]، بينما الحصة الحالية بالقاعة مخصصة لـ [${selectedGrade}]. غير مسموح بدخول طلاب من صفوف دراسية أخرى!`,
+        message: `الطالب (${student.name}) مقيد في [${student.groupGrade}]، بينما الحصة الحالية بالقاعة مخصصة لـ [${targetGrade}]. غير مسموح بدخول طلاب من صفوف دراسية أخرى!`,
         student,
       });
       return;
     }
 
-    // 2. Prevent duplicate scan if student is already in the classroom presence list
-    const alreadyScanned = (scanLogOrder || []).some(
+    // 2. Prevent duplicate scan if student is already in the classroom presence list OR already recorded today
+    const alreadyInQueue = (scanLogOrderRef.current || []).some(
       (b) => String(b).trim() === String(student.barcode).trim()
     );
-    if (alreadyScanned && !overrideStatus) {
-      const existingIso = scanLogTimes?.[student.barcode];
+    const todayStatus = attendanceTodayRef.current?.[student.barcode];
+    const alreadyAttendedToday = todayStatus === "حضور" || todayStatus === "تأخير";
+
+    if ((alreadyInQueue || alreadyAttendedToday) && !overrideStatus) {
+      const existingIso = scanLogTimesRef.current?.[student.barcode];
       const existingTimeStr = existingIso
         ? new Date(existingIso).toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" })
         : "";
-      const existingStatus = attendanceToday?.[student.barcode] || "حضور";
+      const existingStatus = todayStatus || "حضور";
       playBeep("warning");
       setScanAlert({
         type: "warning",
@@ -374,13 +401,13 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     // 3. Record student at entry time & evaluate whether on-time (حضور) or late (تأخير)
     const now = new Date();
     const nowTimeStr = now.toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" });
-    const calculatedStatus = overrideStatus || evaluateAttendanceStatus(now, activeSessionSlotId);
+    const calculatedStatus = overrideStatus || evaluateAttendanceStatus(now, activeSessionSlotIdRef.current);
 
     const monthKey = getCurrentMonthKey();
-    const isPaid = isStudentPaid(payments?.[monthKey], student.barcode);
+    const isPaid = isStudentPaid(paymentsRef.current?.[monthKey], student.barcode);
 
-    if (onRecordAttendance) {
-      onRecordAttendance(student.barcode, calculatedStatus, now.toISOString(), student);
+    if (onRecordAttendanceRef.current) {
+      onRecordAttendanceRef.current(student.barcode, calculatedStatus, now.toISOString(), student);
     } else {
       dualSyncLiveScan({
         barcode: student.barcode,
@@ -398,9 +425,9 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     }
 
     playBeep("success");
-    speakArabicGreeting(student.name, voiceEnabled);
+    speakArabicGreeting(student.name, voiceEnabledRef.current);
 
-    const isCrossDay = student.groupDays !== selectedDays;
+    const isCrossDay = student.groupDays !== targetDays;
     setScanAlert({
       type: "success",
       title: calculatedStatus === "تأخير"
@@ -433,12 +460,22 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     }, 4500);
   };
 
-  // 🎯 Core Scan Processing Function (Normalizes input, strips prefixes, finds student)
+  // 🎯 Core Scan Processing Function (Normalizes input, strips prefixes, deduplicates, finds student)
   const processScannedCode = (rawCode: string) => {
     const clean = normalizeBarcode(rawCode);
     if (!clean) return;
 
-    const matchResult = findStudentByScannedCode(clean, students, studentMap);
+    // Deduplication lock: prevent duplicate scans triggered within 600ms
+    const nowMs = Date.now();
+    if (
+      lastScannedDedupeRef.current.code === clean &&
+      nowMs - lastScannedDedupeRef.current.time < 600
+    ) {
+      return;
+    }
+    lastScannedDedupeRef.current = { code: clean, time: nowMs };
+
+    const matchResult = findStudentByScannedCode(clean, studentsRef.current, studentMapRef.current);
 
     if (!matchResult) {
       playBeep("error");
@@ -453,7 +490,7 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     const student = matchResult.student;
 
     // If in Exit scanning mode (بوابة الخروج)
-    if (scanDirectionMode === "exit") {
+    if (scanDirectionModeRef.current === "exit") {
       const now = new Date();
       const nowTimeStr = now.toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" });
       recordDeviceEntryExitScan({
@@ -479,7 +516,7 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     processAttendance(student);
   };
 
-  // ⚡ Global Hardware USB Barcode Scanner Listener (Never misses a scan even if input is blurred)
+  // ⚡ Global Hardware USB Barcode Scanner Listener (Rock-solid, attached once, never drops keystrokes)
   useEffect(() => {
     let keyBuffer = "";
     let lastKeyTime = Date.now();
@@ -503,7 +540,7 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
       if (e.key === "Enter") {
         if (keyBuffer.trim().length >= 2) {
           e.preventDefault();
-          const scanned = keyBuffer;
+          const scanned = keyBuffer.trim();
           keyBuffer = "";
           setBarcodeInput("");
           processScannedCode(scanned);
@@ -513,8 +550,8 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
         return;
       }
 
-      // If keys arrive too slowly (> 120ms between keys), reset buffer
-      if (diff > 150 && keyBuffer.length > 0) {
+      // If keys arrive too slowly (> 350ms between keys), reset buffer
+      if (diff > 350 && keyBuffer.length > 0) {
         keyBuffer = "";
       }
 
@@ -525,7 +562,7 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
 
     window.addEventListener("keydown", handleWindowKeyDown);
     return () => window.removeEventListener("keydown", handleWindowKeyDown);
-  }, [students, studentMap, selectedGrade, selectedDays, scanDirectionMode, activeSessionSlotId]);
+  }, []);
 
   const handleScanSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -567,9 +604,11 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
     groupStudents.forEach((student) => {
       const bCode = String(student.barcode).trim();
       const isPresentInQueue = queueBarcodeSet.has(bCode);
+      const todayStatus = attendanceToday?.[bCode];
+      const isAlreadyRecordedPresent = todayStatus === "حضور" || todayStatus === "تأخير";
 
-      if (!isPresentInQueue) {
-        // الطالب مقيد بهذه المجموعة ولكنه لم يمر على الإسكانر -> غائب
+      if (!isPresentInQueue && !isAlreadyRecordedPresent) {
+        // الطالب مقيد بهذه المجموعة ولكنه لم يمر على الإسكانر ولم يسجل حضوره اليوم -> غائب
         const msg =
           `تنبيه من منظومة الأستاذة إيمان الدمشيتي 📐\n` +
           `نفيدكم بعلم أن الطالب/ة: (${student.name})\n` +
@@ -578,8 +617,8 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
           `نرجو منكم المتابعة والاهتمام حرصاً على مستواه الدراسي وعدم تفويت المنهج.`;
         absentList.push({ student, message: msg, type: "غائب" });
       } else {
-        // الطالب مسجل حضور في طابور الحصة
-        const currentStatus = attendanceToday?.[student.barcode];
+        // الطالب مسجل حضور في طابور الحصة أو مسجل حضوره اليوم
+        const currentStatus = todayStatus || "حضور";
         const timeIso = scanLogTimes?.[student.barcode];
         const timeStr = timeIso
           ? new Date(timeIso).toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" })
@@ -753,12 +792,16 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
   const totalGroupCount = currentGroupStudents.length;
 
   const currentGroupScanned = useMemo(() => {
-    const scanSet = new Set(scanLogOrder || []);
-    return currentGroupStudents.filter((s) => scanSet.has(s.barcode));
-  }, [currentGroupStudents, scanLogOrder]);
+    const scanSet = new Set((scanLogOrder || []).map(b => String(b).trim()));
+    return currentGroupStudents.filter((s) => {
+      const b = String(s.barcode).trim();
+      const status = attendanceToday?.[b];
+      return scanSet.has(b) || status === "حضور" || status === "تأخير";
+    });
+  }, [currentGroupStudents, scanLogOrder, attendanceToday]);
 
   const currentGroupPresentCount = currentGroupScanned.filter(
-    (s) => attendanceToday?.[s.barcode] === "حضور"
+    (s) => attendanceToday?.[s.barcode] === "حضور" || !attendanceToday?.[s.barcode]
   ).length;
 
   const currentGroupLateCount = currentGroupScanned.filter(
@@ -772,7 +815,7 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
       .filter((s): s is Student => !!s && s.groupGrade === selectedGrade && s.groupDays !== selectedDays);
   }, [scanLogOrder, studentMap, selectedGrade, selectedDays]);
 
-  const currentGroupUnscannedCount = totalGroupCount - currentGroupScanned.length;
+  const currentGroupUnscannedCount = Math.max(0, totalGroupCount - currentGroupScanned.length);
 
   // Real-time detection of scans performed in OTHER grades on other devices/phones
   const otherGradesActiveScans = useMemo(() => {
@@ -793,11 +836,27 @@ export const AttendanceScanner: React.FC<AttendanceScannerProps> = ({
 
   // Active Scanned list in the scanner table - strictly for the selected grade only
   const displayedBarcodes = useMemo(() => {
-    return (scanLogOrder || []).filter((barcode) => {
+    const fromOrder = (scanLogOrder || []).filter((barcode) => {
       const s = studentMap.get(String(barcode).trim());
       return s && s.groupGrade === selectedGrade;
     });
-  }, [scanLogOrder, studentMap, selectedGrade]);
+
+    const set = new Set(fromOrder.map((b) => String(b).trim()));
+    const additional: string[] = [];
+
+    (students || []).forEach((s) => {
+      if (s.groupGrade === selectedGrade) {
+        const b = String(s.barcode).trim();
+        const status = attendanceToday?.[b];
+        if ((status === "حضور" || status === "تأخير") && !set.has(b)) {
+          set.add(b);
+          additional.push(b);
+        }
+      }
+    });
+
+    return [...fromOrder, ...additional];
+  }, [scanLogOrder, studentMap, selectedGrade, attendanceToday, students]);
 
   const filteredBarcodes = useMemo(() => {
     if (!tableSearch.trim()) return displayedBarcodes;

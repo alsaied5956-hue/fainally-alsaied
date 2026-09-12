@@ -364,9 +364,17 @@ export default function App() {
     }
   };
 
-  // Keep latest students reference for realtime events
+  // Synchronous references for rock-solid concurrency during high-speed scanning (100 students / 5 min)
   const appStudentsRef = useRef(students);
   appStudentsRef.current = students;
+  const attendanceTodayRef = useRef(attendanceToday);
+  attendanceTodayRef.current = attendanceToday;
+  const attendanceHistoryRef = useRef(attendanceHistory);
+  attendanceHistoryRef.current = attendanceHistory;
+  const scanLogOrderRef = useRef(scanLogOrder);
+  scanLogOrderRef.current = scanLogOrder;
+  const scanLogTimesRef = useRef(scanLogTimes);
+  scanLogTimesRef.current = scanLogTimes;
 
   // ⚡ Central Supabase Realtime Hub: Listen to Group Finalization, Payments, and Students across all devices (<20ms)
   useEffect(() => {
@@ -383,6 +391,7 @@ export default function App() {
         payload.absentBarcodes.forEach((b) => (next[b] = "غائب"));
         payload.lateBarcodes.forEach((b) => (next[b] = "تأخير"));
         payload.presentBarcodes.forEach((b) => (next[b] = "حضور"));
+        attendanceTodayRef.current = next;
         return next;
       });
 
@@ -391,22 +400,12 @@ export default function App() {
         payload.absentBarcodes.forEach((b) => (dayMap[b] = "غائب"));
         payload.lateBarcodes.forEach((b) => (dayMap[b] = "تأخير"));
         payload.presentBarcodes.forEach((b) => (dayMap[b] = "حضور"));
-        return { ...prev, [payload.dateKey]: dayMap };
+        const nextHist = { ...prev, [payload.dateKey]: dayMap };
+        attendanceHistoryRef.current = nextHist;
+        return nextHist;
       });
 
-      // Clear the finished grade from active scanner list
-      setScanLogOrder((prev) => {
-        const gradeMap = new Map<string, string>();
-        (appStudentsRef.current || []).forEach((s) => s.barcode && gradeMap.set(String(s.barcode).trim(), s.groupGrade));
-        return prev.filter((b) => gradeMap.get(String(b).trim()) !== payload.grade);
-      });
-      setScanLogTimes((prev) => {
-        const next = { ...prev };
-        (appStudentsRef.current || []).forEach((s) => {
-          if (s.groupGrade === payload.grade) delete next[String(s.barcode).trim()];
-        });
-        return next;
-      });
+      // NOTE: Preserving scanLogOrder across devices so students remain visible in the hall
     });
 
     const unsubPayment = subscribeToPaymentChanges((payload) => {
@@ -547,31 +546,45 @@ export default function App() {
     };
   }, []);
 
-  // Handler: Scan Attendance Record
+  // Handler: Scan Attendance Record with 0ms race-condition-free ref updates
   const handleRecordAttendance = useCallback((
     barcode: string,
     status: "حضور" | "تأخير",
     timeIso: string,
     student: Student
   ) => {
-    const updatedToday = { ...attendanceToday, [barcode]: status };
-    const todayKey = getTodayKey();
-    const updatedHistory = {
-      ...attendanceHistory,
-      [todayKey]: updatedToday,
-    };
-    const updatedOrder = scanLogOrder.includes(barcode)
-      ? scanLogOrder
-      : [barcode, ...scanLogOrder];
-    const updatedTimes = { ...scanLogTimes, [barcode]: timeIso };
+    const cleanBarcode = String(barcode).trim();
+    if (!cleanBarcode) return;
 
-    const prevStatus = attendanceToday[barcode];
-    let updatedStudents = students;
+    const todayKey = getTodayKey();
+
+    // 1. Immediately update synchronous references (immune to rapid scan drops)
+    if (!scanLogOrderRef.current.includes(cleanBarcode)) {
+      scanLogOrderRef.current = [cleanBarcode, ...scanLogOrderRef.current];
+    }
+    scanLogTimesRef.current = {
+      ...scanLogTimesRef.current,
+      [cleanBarcode]: timeIso,
+    };
+    attendanceTodayRef.current = {
+      ...attendanceTodayRef.current,
+      [cleanBarcode]: status,
+    };
+    attendanceHistoryRef.current = {
+      ...attendanceHistoryRef.current,
+      [todayKey]: {
+        ...(attendanceHistoryRef.current[todayKey] || {}),
+        [cleanBarcode]: status,
+      },
+    };
+
+    const prevStatus = attendanceTodayRef.current[cleanBarcode];
+    let updatedStudents = appStudentsRef.current;
     
-    // Only update student record if attendance state actually newly increments
-    if (!prevStatus) {
-      updatedStudents = students.map((s) => {
-        if (s.barcode === barcode) {
+    // Only increment attendance days if student was not already marked present today
+    if (!prevStatus || prevStatus === "غائب") {
+      updatedStudents = appStudentsRef.current.map((s) => {
+        if (String(s.barcode).trim() === cleanBarcode) {
           return {
             ...s,
             totalAttendanceDays: (s.totalAttendanceDays || 0) + 1,
@@ -579,32 +592,47 @@ export default function App() {
         }
         return s;
       });
+      appStudentsRef.current = updatedStudents;
       setStudents(updatedStudents);
     }
 
-    setAttendanceToday(updatedToday);
-    setAttendanceHistory(updatedHistory);
-    setScanLogOrder(updatedOrder);
-    setScanLogTimes(updatedTimes);
+    // 2. Functional React updates ensure state is never dropped in rapid succession
+    setAttendanceToday((prev) => ({ ...prev, [cleanBarcode]: status }));
+    setAttendanceHistory((prev) => ({
+      ...prev,
+      [todayKey]: {
+        ...(prev[todayKey] || {}),
+        [cleanBarcode]: status,
+      },
+    }));
+    setScanLogOrder((prev) => (prev.includes(cleanBarcode) ? prev : [cleanBarcode, ...prev]));
+    setScanLogTimes((prev) => ({ ...prev, [cleanBarcode]: timeIso }));
 
     // ⚡ Dual-Sync to Firebase and Supabase immediately with sourceDeviceId
     dualSyncLiveScan({
-      barcode,
+      barcode: cleanBarcode,
       name: student.name,
       grade: student.groupGrade,
       days: student.groupDays,
       status,
       timeIso,
       timeDisplay: new Date(timeIso).toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" }),
-      isPaid: isStudentPaid(payments?.[getCurrentMonthKey()], barcode),
+      isPaid: isStudentPaid(payments?.[getCurrentMonthKey()], cleanBarcode),
       scannedBy: currentUser?.username || "الماسح",
       studentFallback: student,
       sourceDeviceId: getPersistentDeviceId(),
     });
 
-    // Instant local save with batching
-    saveAttendanceAndStudentsBatch(updatedToday, updatedOrder, updatedTimes, updatedStudents, false, true);
-  }, [attendanceToday, attendanceHistory, scanLogOrder, scanLogTimes, students, payments, currentUser]);
+    // Instant local save with batching using authoritative refs
+    saveAttendanceAndStudentsBatch(
+      attendanceTodayRef.current,
+      scanLogOrderRef.current,
+      scanLogTimesRef.current,
+      updatedStudents,
+      false,
+      true
+    );
+  }, [payments, currentUser]);
 
   // Handler: Manual sync for group attendance session in one single operation
   const handleSyncGroupSession = useCallback(async () => {
@@ -636,26 +664,32 @@ export default function App() {
       pushLiveAttendanceBatch(batchEvents);
     }
 
-    const groupStudents = students.filter(
+    const groupStudents = (appStudentsRef.current || students).filter(
       (s) => s.groupGrade === grade && s.groupDays === days
     );
 
-    const updatedToday = { ...attendanceToday };
+    const updatedToday = { ...attendanceTodayRef.current, ...attendanceToday };
     const absentBarcodes = new Set((absentList || []).map((a) => String(a.student.barcode).trim()));
     const lateBarcodes = new Set((lateList || []).map((l) => String(l.student.barcode).trim()));
     
     // 1. Explicitly update status for EVERY student registered in this group:
-    // Anyone not in queue (absentBarcodes) becomes "غائب"
     // Anyone in lateBarcodes becomes "تأخير"
     // All scanned queue students in this group become "حضور"
+    // Anyone in absentBarcodes becomes "غائب" UNLESS they were already marked "حضور" or "تأخير"!
     groupStudents.forEach((student) => {
       const b = String(student.barcode).trim();
+      const priorStatus = attendanceTodayRef.current[b] || attendanceToday[b];
       if (absentBarcodes.has(b)) {
-        updatedToday[b] = "غائب";
+        // If the student was ALREADY scanned or marked present today, never downgrade them to absent!
+        if (priorStatus === "حضور" || priorStatus === "تأخير") {
+          updatedToday[b] = priorStatus;
+        } else {
+          updatedToday[b] = "غائب";
+        }
       } else if (lateBarcodes.has(b)) {
         updatedToday[b] = "تأخير";
       } else {
-        updatedToday[b] = "حضور";
+        updatedToday[b] = priorStatus === "تأخير" ? "تأخير" : "حضور";
       }
     });
 
@@ -671,66 +705,54 @@ export default function App() {
       [todayKey]: updatedToday,
     };
 
-    const updatedStudents = students.map((s) => {
+    const updatedStudents = (appStudentsRef.current || students).map((s) => {
       const b = String(s.barcode).trim();
-      if (absentBarcodes.has(b)) {
+      if (absentBarcodes.has(b) && updatedToday[b] === "غائب") {
         const wasAbsent = attendanceToday[b] === "غائب";
-        const wasPresent = attendanceToday[b] === "حضور" || attendanceToday[b] === "تأخير";
         if (!wasAbsent) {
           return {
             ...s,
             totalAbsentDays: (s.totalAbsentDays || 0) + 1,
-            totalAttendanceDays: wasPresent ? Math.max(0, (s.totalAttendanceDays || 0) - 1) : (s.totalAttendanceDays || 0),
+            totalAttendanceDays: Math.max(0, (s.totalAttendanceDays || 0) - 1),
           };
         }
       }
       return s;
     });
 
-    // Clear the finished group's barcodes AND all students of this grade from the active room scanner screen
-    const studentGradeMap = new Map<string, GradeName>();
-    students.forEach((s) => {
-      if (s?.barcode) studentGradeMap.set(String(s.barcode).trim(), s.groupGrade);
-    });
+    // CRITICAL: PRESERVE scanLogOrder and scanLogTimes! Do NOT wipe the active queue upon group save!
+    const currentScanOrder = scanLogOrderRef.current.length > 0 ? scanLogOrderRef.current : scanLogOrder;
+    const currentScanTimes = Object.keys(scanLogTimesRef.current).length > 0 ? scanLogTimesRef.current : scanLogTimes;
 
-    const remainingScanOrder = scanLogOrder.filter((b) => {
-      const g = studentGradeMap.get(String(b).trim());
-      // Remove all students belonging to this grade from the active scanner room
-      return g ? g !== grade : false;
-    });
-
-    const remainingScanTimes = { ...scanLogTimes };
-    scanLogOrder.forEach((b) => {
-      const g = studentGradeMap.get(String(b).trim());
-      if (g === grade) {
-        delete remainingScanTimes[b];
-      }
-    });
-
-    setScanLogOrder(remainingScanOrder);
-    setScanLogTimes(remainingScanTimes);
+    attendanceTodayRef.current = updatedToday;
+    attendanceHistoryRef.current = updatedHistory;
+    appStudentsRef.current = updatedStudents;
+    scanLogOrderRef.current = currentScanOrder;
+    scanLogTimesRef.current = currentScanTimes;
 
     setAttendanceToday(updatedToday);
     setAttendanceHistory(updatedHistory);
     setStudents(updatedStudents);
+    setScanLogOrder(currentScanOrder);
+    setScanLogTimes(currentScanTimes);
 
-    // Save and immediately sync to cloud and local storage
-    saveAttendanceAndStudentsBatch(updatedToday, remainingScanOrder, remainingScanTimes, updatedStudents, true);
+    // Save and immediately sync to cloud and local storage with the preserved scan queue
+    saveAttendanceAndStudentsBatch(updatedToday, currentScanOrder, currentScanTimes, updatedStudents, true);
 
     // ⚡ Dual-Sync Group Finalization to Firebase and Supabase
     dualSyncGroupFinished({
       grade,
       days,
-      absentBarcodes: Array.from(absentBarcodes),
+      absentBarcodes: Array.from(absentBarcodes).filter(b => updatedToday[b] === "غائب"),
       lateBarcodes: Array.from(lateBarcodes),
       presentBarcodes: groupStudents
         .map((s) => String(s.barcode).trim())
-        .filter((b) => !absentBarcodes.has(b) && !lateBarcodes.has(b)),
+        .filter((b) => updatedToday[b] === "حضور"),
       dateKey: todayKey,
       finishedBy: currentUser?.username || "الماسح",
       allStudents: groupStudents,
     });
-  }, [students, attendanceToday, attendanceHistory, scanLogOrder, scanLogTimes, currentUser]);
+  }, [attendanceToday, attendanceHistory, scanLogOrder, scanLogTimes, currentUser]);
 
   // Handler: Remove single student from active scanner screen
   const handleRemoveFromScanner = useCallback((barcode: string) => {

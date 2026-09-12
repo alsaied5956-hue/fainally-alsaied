@@ -429,12 +429,45 @@ async function startServer() {
       return res.status(400).json({ ok: false, error: "No data payload provided" });
     }
 
-    cachedServerState = data;
+    let stateToSave = data;
+    if (cachedServerState && typeof cachedServerState === "object") {
+      // Intelligently merge attendanceToday and scanLogOrder so no terminal ever wipes another terminal's scans
+      const existingToday = cachedServerState.attendanceToday || {};
+      const incomingToday = data.attendanceToday || {};
+      const mergedToday: Record<string, string> = { ...existingToday, ...incomingToday };
+
+      // Ensure physical presence (حضور or تأخير) is never downgraded or wiped
+      for (const [b, st] of Object.entries(existingToday)) {
+        if ((st === "حضور" || st === "تأخير") && mergedToday[b] !== "حضور" && mergedToday[b] !== "تأخير") {
+          mergedToday[b] = st as string;
+        }
+      }
+
+      // Merge scanLogOrder union without losing any student
+      const existingOrder = Array.isArray(cachedServerState.scanLogOrder) ? cachedServerState.scanLogOrder : [];
+      const incomingOrder = Array.isArray(data.scanLogOrder) ? data.scanLogOrder : [];
+      const combinedOrder = Array.from(new Set([...incomingOrder, ...existingOrder]));
+
+      const combinedScanTimes = {
+        ...(cachedServerState.scanLogTimes || {}),
+        ...(data.scanLogTimes || {}),
+      };
+
+      stateToSave = {
+        ...cachedServerState,
+        ...data,
+        attendanceToday: mergedToday,
+        scanLogOrder: combinedOrder,
+        scanLogTimes: combinedScanTimes,
+      };
+    }
+
+    cachedServerState = stateToSave;
     lastServerUpdate = Date.now();
 
     // Persist to disk asynchronously
     try {
-      fs.writeFileSync(SYNC_STATE_FILE, JSON.stringify(data), "utf-8");
+      fs.writeFileSync(SYNC_STATE_FILE, JSON.stringify(stateToSave), "utf-8");
     } catch (err) {
       console.error("[Sync Hub] Failed to write unified state to disk:", err);
     }
@@ -444,7 +477,7 @@ async function startServer() {
       type: "state_update",
       sourceDeviceId: sourceDeviceId || "unknown",
       updatedAt: lastServerUpdate,
-      data,
+      data: stateToSave,
     });
 
     // Mirror asynchronously to Cloud Firestore so all external platforms stay 100% unified

@@ -1399,58 +1399,64 @@ export function mergeCloudDataWithLocal(local: SystemData, cloud: Partial<System
     }
   }
 
-  let mergedToday: Record<string, string>;
-  if (localTime >= cloudTime) {
-    mergedToday = {
-      ...(cloud.attendanceToday || {}),
-      ...(local.attendanceToday || {}),
-    };
-  } else {
-    mergedToday = {
-      ...(local.attendanceToday || {}),
-      ...(cloud.attendanceToday || {}),
-    };
-  }
+  // 2. Merge Today's Attendance without EVER downgrading or dropping physical attendance
+  const allTodayBarcodes = new Set([
+    ...Object.keys(cloud.attendanceToday || {}),
+    ...Object.keys(local.attendanceToday || {}),
+  ]);
+  const mergedToday: Record<string, string> = {};
+  allTodayBarcodes.forEach((b) => {
+    const loc = local.attendanceToday?.[b];
+    const cld = cloud.attendanceToday?.[b];
+    // If marked "حضور" or "تأخير" on either local or cloud, prioritize physical entry!
+    if (loc === "حضور" || cld === "حضور") {
+      mergedToday[b] = "حضور";
+    } else if (loc === "تأخير" || cld === "تأخير") {
+      mergedToday[b] = "تأخير";
+    } else {
+      mergedToday[b] = loc || cld || "غائب";
+    }
+  });
 
   mergedHistory[todayKey] = {
     ...(mergedHistory[todayKey] || {}),
     ...mergedToday,
   };
 
-  // 3. Merge Scan Log Order & Times (authoritative by latest modification timestamp)
+  // 3. Merge Scan Log Order & Times: Smart Union of local and cloud scans (never overwrite or wipe)
   const remoteOrder = Array.isArray(cloud.scanLogOrder) ? cloud.scanLogOrder : [];
   const localOrder = Array.isArray(local.scanLogOrder) ? local.scanLogOrder : [];
 
-  const localScanTime = parseTimestamp(local.scanLogUpdatedAt || local.updatedAt);
-  const cloudScanTime = parseTimestamp(cloud.scanLogUpdatedAt || cloud.updatedAt);
+  const combinedScanTimes: Record<string, string> = {
+    ...(cloud.scanLogTimes || {}),
+    ...(local.scanLogTimes || {}),
+  };
 
-  let chosenOrder: string[];
-  let chosenScanTimes: Record<string, string>;
-
-  if (cloudScanTime > localScanTime) {
-    // Cloud has the newer scanner session state (e.g. session finished/cleared or students scanned on another device)
-    chosenOrder = [...remoteOrder];
-    chosenScanTimes = { ...(cloud.scanLogTimes || {}) };
-  } else {
-    // Local device has the newer or equal scanner session state
-    chosenOrder = [...localOrder];
-    chosenScanTimes = { ...(local.scanLogTimes || {}) };
-  }
-
-  // Deduplicate and filter out deleted barcodes
+  // Deduplicate and filter out deleted barcodes while preserving order of entry
   const orderSet = new Set<string>();
   const preMergedOrder: string[] = [];
 
-  chosenOrder.forEach((barcode) => {
-    if (barcode && !orderSet.has(barcode) && !deletedSet.has(barcode)) {
-      orderSet.add(barcode);
-      preMergedOrder.push(barcode);
+  // Local device scans first (immediate queue on this terminal)
+  localOrder.forEach((barcode) => {
+    const b = String(barcode || "").trim();
+    if (b && !orderSet.has(b) && !deletedSet.has(b)) {
+      orderSet.add(b);
+      preMergedOrder.push(b);
+    }
+  });
+
+  // Remote scans next (scans registered on other assistants' devices or cloud)
+  remoteOrder.forEach((barcode) => {
+    const b = String(barcode || "").trim();
+    if (b && !orderSet.has(b) && !deletedSet.has(b)) {
+      orderSet.add(b);
+      preMergedOrder.push(b);
     }
   });
 
   // Filter out any stale scans that are from a previous date so the scanner is always fresh for today
   const mergedOrder = preMergedOrder.filter((barcode) => {
-    const timeIso = chosenScanTimes[barcode];
+    const timeIso = combinedScanTimes[barcode];
     if (typeof timeIso === "string" && timeIso.includes("T")) {
       return timeIso.startsWith(todayKey);
     }
@@ -1459,8 +1465,8 @@ export function mergeCloudDataWithLocal(local: SystemData, cloud: Partial<System
 
   const mergedScanTimes: Record<string, string> = {};
   mergedOrder.forEach((barcode) => {
-    if (chosenScanTimes[barcode]) {
-      mergedScanTimes[barcode] = chosenScanTimes[barcode];
+    if (combinedScanTimes[barcode]) {
+      mergedScanTimes[barcode] = combinedScanTimes[barcode];
     }
   });
 
