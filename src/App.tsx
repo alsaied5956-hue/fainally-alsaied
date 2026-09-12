@@ -43,6 +43,8 @@ import {
   formatArabicDate,
   formatTimeArabic,
   isStudentPaid,
+  getImmediatelyPrecedingClassDate,
+  getArabicDayName,
 } from "./utils/helpers";
 import {
   subscribeToGroupFinished,
@@ -97,7 +99,10 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => {
     if (typeof window !== "undefined") {
       try {
-        const saved = localStorage.getItem("center_current_user");
+        // Enforce session security: clear persistent localStorage on startup
+        // Reopening browser/tab always requires entering password again
+        localStorage.removeItem("center_current_user");
+        const saved = sessionStorage.getItem("center_current_user");
         if (saved) {
           const u = JSON.parse(saved);
           if (u && u.username) return u;
@@ -560,17 +565,38 @@ export default function App() {
       ...attendanceHistory,
       [todayKey]: updatedToday,
     };
+
+    // If student was absent in the immediately preceding class date, mark that date as "حضور تعويضي"
+    const prevClassDateKey = getImmediatelyPrecedingClassDate(todayKey, attendanceHistory);
+    let updatedStudents = students;
+    if (prevClassDateKey && attendanceHistory[prevClassDateKey]?.[barcode] === "غائب") {
+      updatedHistory[prevClassDateKey] = {
+        ...(updatedHistory[prevClassDateKey] || {}),
+        [barcode]: "حضور تعويضي",
+      };
+      // Compensated absence: reduce totalAbsentDays by 1
+      updatedStudents = updatedStudents.map((s) => {
+        if (s.barcode === barcode && (s.totalAbsentDays || 0) > 0) {
+          return {
+            ...s,
+            totalAbsentDays: Math.max(0, (s.totalAbsentDays || 0) - 1),
+            totalAttendanceDays: (s.totalAttendanceDays || 0) + 1,
+          };
+        }
+        return s;
+      });
+    }
+
     const updatedOrder = scanLogOrder.includes(barcode)
       ? scanLogOrder
       : [barcode, ...scanLogOrder];
     const updatedTimes = { ...scanLogTimes, [barcode]: timeIso };
 
     const prevStatus = attendanceToday[barcode];
-    let updatedStudents = students;
     
-    // Only update student record if attendance state actually newly increments
-    if (!prevStatus) {
-      updatedStudents = students.map((s) => {
+    // Only update student record if attendance state actually newly increments and wasn't adjusted above
+    if (!prevStatus && !prevClassDateKey) {
+      updatedStudents = updatedStudents.map((s) => {
         if (s.barcode === barcode) {
           return {
             ...s,
@@ -579,9 +605,9 @@ export default function App() {
         }
         return s;
       });
-      setStudents(updatedStudents);
     }
 
+    setStudents(updatedStudents);
     setAttendanceToday(updatedToday);
     setAttendanceHistory(updatedHistory);
     setScanLogOrder(updatedOrder);
@@ -602,8 +628,8 @@ export default function App() {
       sourceDeviceId: getPersistentDeviceId(),
     });
 
-    // Instant local save with batching
-    saveAttendanceAndStudentsBatch(updatedToday, updatedOrder, updatedTimes, updatedStudents, false, true);
+    // Instant local save with batching including updatedHistory
+    saveAttendanceAndStudentsBatch(updatedToday, updatedOrder, updatedTimes, updatedStudents, false, true, updatedHistory);
   }, [attendanceToday, attendanceHistory, scanLogOrder, scanLogTimes, students, payments, currentUser]);
 
   // Handler: Manual sync for group attendance session in one single operation
@@ -617,7 +643,8 @@ export default function App() {
     days: GroupDays,
     absentList: { student: Student; message: string; type?: "غائب" }[],
     lateList: { student: Student; message: string; type?: "تأخير" }[],
-    crossDayList?: { student: Student; message: string; type?: "عكس_أيام" }[]
+    crossDayList?: { student: Student; message: string; type?: "عكس_أيام" }[],
+    advanceCompensationList?: { student: Student; prevDateKey: string; prevStatus: string }[]
   ) => {
     // 1️⃣ Live Event Pipeline: Coordinated batch push to `live_events/today` without document write collisions
     const batchEvents = [
@@ -643,14 +670,18 @@ export default function App() {
     const updatedToday = { ...attendanceToday };
     const absentBarcodes = new Set((absentList || []).map((a) => String(a.student.barcode).trim()));
     const lateBarcodes = new Set((lateList || []).map((l) => String(l.student.barcode).trim()));
+    const advanceBarcodes = new Set((advanceCompensationList || []).map((a) => String(a.student.barcode).trim()));
     
     // 1. Explicitly update status for EVERY student registered in this group:
+    // Anyone in advanceBarcodes becomes "حضور تعويضي" (attended in advance on previous date)
     // Anyone not in queue (absentBarcodes) becomes "غائب"
     // Anyone in lateBarcodes becomes "تأخير"
     // All scanned queue students in this group become "حضور"
     groupStudents.forEach((student) => {
       const b = String(student.barcode).trim();
-      if (absentBarcodes.has(b)) {
+      if (advanceBarcodes.has(b)) {
+        updatedToday[b] = "حضور تعويضي";
+      } else if (absentBarcodes.has(b)) {
         updatedToday[b] = "غائب";
       } else if (lateBarcodes.has(b)) {
         updatedToday[b] = "تأخير";
@@ -662,7 +693,8 @@ export default function App() {
     // 2. Also ensure makeup cross-day students are marked in today's attendance
     (crossDayList || []).forEach((item) => {
       const b = String(item.student.barcode).trim();
-      updatedToday[b] = attendanceToday[b] === "تأخير" ? "تأخير" : "حضور";
+      const currentSt = attendanceToday[b];
+      updatedToday[b] = currentSt?.includes("تأخير") ? "تأخير تعويضي" : "حضور تعويضي";
     });
 
     const todayKey = getTodayKey();
@@ -671,7 +703,38 @@ export default function App() {
       [todayKey]: updatedToday,
     };
 
-    const updatedStudents = students.map((s) => {
+    // If any cross-day student attended today, check if they missed the immediately preceding class date
+    const prevClassDateKey = getImmediatelyPrecedingClassDate(todayKey, attendanceHistory);
+    let updatedStudents = students;
+    if (prevClassDateKey && (crossDayList || []).length > 0) {
+      const prevClassRecord = { ...(updatedHistory[prevClassDateKey] || {}) };
+      let modifiedPrev = false;
+
+      (crossDayList || []).forEach((item) => {
+        const b = String(item.student.barcode).trim();
+        if (prevClassRecord[b] === "غائب" || !prevClassRecord[b]) {
+          prevClassRecord[b] = "حضور تعويضي";
+          modifiedPrev = true;
+          // Compensate absence count
+          updatedStudents = updatedStudents.map((s) => {
+            if (s.barcode === b && (s.totalAbsentDays || 0) > 0) {
+              return {
+                ...s,
+                totalAbsentDays: Math.max(0, (s.totalAbsentDays || 0) - 1),
+                totalAttendanceDays: (s.totalAttendanceDays || 0) + 1,
+              };
+            }
+            return s;
+          });
+        }
+      });
+
+      if (modifiedPrev) {
+        updatedHistory[prevClassDateKey] = prevClassRecord;
+      }
+    }
+
+    updatedStudents = updatedStudents.map((s) => {
       const b = String(s.barcode).trim();
       if (absentBarcodes.has(b)) {
         const wasAbsent = attendanceToday[b] === "غائب";
@@ -715,7 +778,7 @@ export default function App() {
     setStudents(updatedStudents);
 
     // Save and immediately sync to cloud and local storage
-    saveAttendanceAndStudentsBatch(updatedToday, remainingScanOrder, remainingScanTimes, updatedStudents, true);
+    saveAttendanceAndStudentsBatch(updatedToday, remainingScanOrder, remainingScanTimes, updatedStudents, true, false, updatedHistory);
 
     // ⚡ Dual-Sync Group Finalization to Firebase and Supabase
     dualSyncGroupFinished({
@@ -1248,7 +1311,8 @@ export default function App() {
           onLoginSuccess={(user) => {
             setCurrentUser(user);
             try {
-              localStorage.setItem("center_current_user", JSON.stringify(user));
+              sessionStorage.setItem("center_current_user", JSON.stringify(user));
+              localStorage.removeItem("center_current_user");
             } catch {}
           }}
         />
@@ -1277,6 +1341,7 @@ export default function App() {
             onLogout={() => {
               setCurrentUser(null);
               try {
+                sessionStorage.removeItem("center_current_user");
                 localStorage.removeItem("center_current_user");
               } catch {}
             }}
@@ -1367,6 +1432,7 @@ export default function App() {
                 <AttendanceScanner
                   students={students}
                   attendanceToday={attendanceToday}
+                  attendanceHistory={attendanceHistory}
                   scanLogOrder={scanLogOrder}
                   scanLogTimes={scanLogTimes}
                   payments={payments}

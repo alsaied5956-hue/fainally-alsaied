@@ -21,6 +21,7 @@ export const DailyAttendanceReport: React.FC<DailyAttendanceReportProps> = ({
   const [selectedDate, setSelectedDate] = useState<string>(getTodayKey());
   const [filterGrade, setFilterGrade] = useState<string>("ALL");
   const [filterDays, setFilterDays] = useState<string>("ALL");
+  const [filterStatus, setFilterStatus] = useState<string>("ALL");
   const [searchQuery, setSearchQuery] = useState("");
 
   const [editingStudent, setEditingStudent] = useState<{ barcode: string; name: string; currentStatus: string } | null>(null);
@@ -31,7 +32,24 @@ export const DailyAttendanceReport: React.FC<DailyAttendanceReportProps> = ({
   const filteredStudents = useMemo(() => {
     const base = students.filter((s) => {
       if (filterGrade !== "ALL" && s.groupGrade !== filterGrade) return false;
-      if (filterDays !== "ALL" && s.groupDays !== filterDays) return false;
+      
+      // When filtering by days, include students of that days group OR any student who attended on this date as make-up
+      if (filterDays !== "ALL") {
+        const matchesGroupDays = s.groupDays === filterDays;
+        const attendedOnDate = Boolean(dateAttendanceMap[s.barcode]);
+        if (!matchesGroupDays && !attendedOnDate) return false;
+      }
+
+      // Status filter
+      if (filterStatus !== "ALL") {
+        const st = dateAttendanceMap[s.barcode] || "لم يسجل";
+        if (filterStatus === "حضور تعويضي") {
+          if (!st.includes("تعويض")) return false;
+        } else if (st !== filterStatus) {
+          return false;
+        }
+      }
+
       return true;
     });
 
@@ -48,21 +66,23 @@ export const DailyAttendanceReport: React.FC<DailyAttendanceReportProps> = ({
     }
 
     return sortStudentsByGradeAndName(base);
-  }, [students, filterGrade, filterDays, searchQuery]);
+  }, [students, filterGrade, filterDays, filterStatus, dateAttendanceMap, searchQuery]);
 
-  const { presentCount, lateCount, absentCount } = useMemo(() => {
+  const { presentCount, lateCount, absentCount, makeupCount } = useMemo(() => {
     let present = 0;
     let late = 0;
     let absent = 0;
+    let makeup = 0;
 
     filteredStudents.forEach((s) => {
       const st = dateAttendanceMap[s.barcode];
-      if (st === "حضور") present++;
+      if (st?.includes("تعويض")) makeup++;
+      else if (st === "حضور") present++;
       else if (st === "تأخير") late++;
       else if (st === "غائب") absent++;
     });
 
-    return { presentCount: present, lateCount: late, absentCount: absent };
+    return { presentCount: present, lateCount: late, absentCount: absent, makeupCount: makeup };
   }, [filteredStudents, dateAttendanceMap]);
 
   const handleSaveStatus = (e: React.FormEvent) => {
@@ -75,7 +95,7 @@ export const DailyAttendanceReport: React.FC<DailyAttendanceReportProps> = ({
   return (
     <div className="space-y-6">
       {/* Stat Cards */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3.5">
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3.5">
         <div className="glass-card p-4 rounded-3xl text-center shadow-lg hover:border-amber-400/40 transition-all duration-300">
           <p className="text-xs text-slate-400 font-tajawal font-medium mb-1">الطلاب المحددين</p>
           <p className="text-2xl md:text-3xl font-black text-amber-300 font-mono">{filteredStudents.length}</p>
@@ -87,6 +107,10 @@ export const DailyAttendanceReport: React.FC<DailyAttendanceReportProps> = ({
         <div className="glass-card p-4 rounded-3xl text-center shadow-lg hover:border-amber-400/40 transition-all duration-300">
           <p className="text-xs text-amber-400 font-tajawal font-medium mb-1">🟡 تأخير</p>
           <p className="text-2xl md:text-3xl font-black text-amber-400 font-mono">{lateCount}</p>
+        </div>
+        <div className="glass-card p-4 rounded-3xl text-center shadow-lg hover:border-sky-400/40 transition-all duration-300 bg-sky-950/20 border-sky-500/20">
+          <p className="text-xs text-sky-400 font-tajawal font-medium mb-1">🔵 حضور تعويضي</p>
+          <p className="text-2xl md:text-3xl font-black text-sky-400 font-mono">{makeupCount}</p>
         </div>
         <div className="glass-card p-4 rounded-3xl text-center shadow-lg hover:border-rose-400/40 transition-all duration-300">
           <p className="text-xs text-rose-400 font-tajawal font-medium mb-1">🔴 غائب</p>
@@ -131,6 +155,20 @@ export const DailyAttendanceReport: React.FC<DailyAttendanceReportProps> = ({
             <option value="ALL" className="bg-slate-900 text-white">كل الأيام</option>
             <option value="سبت - إثنين - أربعاء" className="bg-slate-900 text-white">سبت - إثنين - أربعاء</option>
             <option value="أحد - ثلاثاء - خميس" className="bg-slate-900 text-white">أحد - ثلاثاء - خميس</option>
+          </select>
+
+          {/* Filter Attendance Status */}
+          <select
+            value={filterStatus}
+            onChange={(e) => setFilterStatus(e.target.value)}
+            className="bg-[#080d1e] border border-indigo-500/30 text-slate-100 text-xs font-bold px-3.5 py-2.5 rounded-2xl outline-none"
+          >
+            <option value="ALL" className="bg-slate-900 text-white">كل الحالات</option>
+            <option value="حضور" className="bg-slate-900 text-white">🟢 حضور تام</option>
+            <option value="تأخير" className="bg-slate-900 text-white">🟡 تأخير</option>
+            <option value="حضور تعويضي" className="bg-slate-900 text-white">🔵 حضور تعويضي</option>
+            <option value="غائب" className="bg-slate-900 text-white">🔴 غائب</option>
+            <option value="لم يسجل" className="bg-slate-900 text-white">⚪ لم يسجل</option>
           </select>
 
           {/* Seamless Search Input */}
@@ -202,20 +240,31 @@ export const DailyAttendanceReport: React.FC<DailyAttendanceReportProps> = ({
                 filteredStudents.map((student, idx) => {
                   const status = dateAttendanceMap[student.barcode] || "لم يسجل";
                   let statusBg = "bg-slate-800 text-slate-400 border-slate-700";
-                  if (status === "حضور") statusBg = "bg-emerald-500/20 text-emerald-300 border-emerald-500/40";
+                  const isMakeup = status.includes("تعويض");
+                  if (isMakeup) statusBg = "bg-sky-500/20 text-sky-300 border-sky-500/50 font-black";
+                  else if (status === "حضور") statusBg = "bg-emerald-500/20 text-emerald-300 border-emerald-500/40";
                   else if (status === "تأخير") statusBg = "bg-amber-500/20 text-amber-300 border-amber-500/40";
                   else if (status === "غائب") statusBg = "bg-rose-500/20 text-rose-300 border-rose-500/40";
+
+                  const isCrossDayStudent = filterDays !== "ALL" && student.groupDays !== filterDays;
 
                   return (
                     <tr key={student.barcode} className="hover:bg-indigo-500/10 transition-colors font-medium">
                       <td className="p-3.5 font-mono text-slate-400">{idx + 1}</td>
                       <td className="p-3.5 font-mono text-amber-300 font-bold">{student.barcode}</td>
-                      <td className="p-3.5 font-bold text-slate-100">{student.name}</td>
+                      <td className="p-3.5 font-bold text-slate-100">
+                        <span>{student.name}</span>
+                        {isCrossDayStudent && (
+                          <span className="block text-[10px] text-sky-400 font-normal">
+                            مقيد بمجموعة: ({student.groupDays}) - حضر تعويضاً
+                          </span>
+                        )}
+                      </td>
                       <td className="p-3.5 text-slate-300">{student.groupGrade}</td>
                       <td className="p-3.5 text-slate-400">{student.groupDays}</td>
                       <td className="p-3.5">
                         <span className={`px-3 py-1 rounded-full text-xs font-bold border inline-block ${statusBg}`}>
-                          {status}
+                          {isMakeup ? `🔵 ${status}` : status}
                         </span>
                       </td>
                       <td className="p-3.5 font-mono text-slate-300">{student.parentPhone}</td>
@@ -283,6 +332,7 @@ export const DailyAttendanceReport: React.FC<DailyAttendanceReportProps> = ({
                   className="w-full bg-[#090e17] border border-amber-500/40 text-slate-100 px-3 py-2.5 rounded-xl font-bold text-sm outline-none"
                 >
                   <option value="حضور">🟢 حضور (في الموعد)</option>
+                  <option value="حضور تعويضي">🔵 حضور تعويضي (تعويض أيام)</option>
                   <option value="تأخير">🟡 تأخير</option>
                   <option value="غائب">🔴 غائب</option>
                   <option value="إذن">⚪ إذن مسبق / عذر</option>

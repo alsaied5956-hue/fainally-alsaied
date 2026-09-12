@@ -58,6 +58,62 @@ export function formatArabicDate(dateStr?: string): string {
   }
 }
 
+/**
+ * Returns Arabic name of the day for a given YYYY-MM-DD date key
+ */
+export function getArabicDayName(dateStr?: string): string {
+  try {
+    const parts = (dateStr || getTodayKey()).split("-").map(Number);
+    const d = new Date(parts[0], parts[1] - 1, parts[2], 12, 0, 0);
+    const days = ["الأحد", "الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"];
+    return days[d.getDay()] || "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Returns the immediately preceding class date key (YYYY-MM-DD) for mutual compensation days:
+ * - Sunday (أحد) -> Saturday (سبت) [1 day back]
+ * - Monday (إثنين) -> Sunday (أحد) [1 day back]
+ * - Tuesday (ثلاثاء) -> Monday (إثنين) [1 day back]
+ * - Wednesday (أربعاء) -> Tuesday (ثلاثاء) [1 day back]
+ * - Thursday (خميس) -> Wednesday (أربعاء) [1 day back]
+ * - Friday (جمعة) -> Thursday (خميس) [1 day back]
+ * - Saturday (سبت) -> Thursday (خميس) [2 days back] or Friday if Friday had attendance
+ */
+export function getImmediatelyPrecedingClassDate(
+  currentDateStr: string = getTodayKey(),
+  attendanceHistory?: Record<string, Record<string, string>>
+): string {
+  try {
+    const parts = currentDateStr.split("-").map(Number);
+    const d = new Date(parts[0], parts[1] - 1, parts[2], 12, 0, 0);
+    const day = d.getDay(); // 0 = Sun, 1 = Mon, 2 = Tue, 3 = Wed, 4 = Thu, 5 = Fri, 6 = Sat
+
+    let daysBack = 1;
+    if (day === 6) {
+      // Saturday: Check if Friday had attendance recorded in history, otherwise go back to Thursday (2 days)
+      const friTime = d.getTime() - 86400000;
+      const friDate = new Date(friTime);
+      const friKey = `${friDate.getFullYear()}-${String(friDate.getMonth() + 1).padStart(2, "0")}-${String(friDate.getDate()).padStart(2, "0")}`;
+      if (attendanceHistory && attendanceHistory[friKey] && Object.keys(attendanceHistory[friKey]).length > 0) {
+        daysBack = 1;
+      } else {
+        daysBack = 2; // Thursday
+      }
+    }
+
+    const prev = new Date(d.getTime() - daysBack * 86400000);
+    const y = prev.getFullYear();
+    const m = String(prev.getMonth() + 1).padStart(2, "0");
+    const dayNum = String(prev.getDate()).padStart(2, "0");
+    return `${y}-${m}-${dayNum}`;
+  } catch {
+    return currentDateStr;
+  }
+}
+
 // Convert Arabic digits to English, remove non-digits, and normalize Egypt WhatsApp
 export function cleanPhoneNumber(phone?: string): string {
   if (!phone) return "";

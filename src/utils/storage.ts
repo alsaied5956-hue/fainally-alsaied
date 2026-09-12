@@ -473,7 +473,7 @@ export function loadLocalData(): SystemData {
       if (typeof timeIso === "string" && timeIso.includes("T")) {
         return timeIso.startsWith(todayKey);
       }
-      return true;
+      return false;
     });
 
     const filteredScanTimes: Record<string, string> = {};
@@ -520,7 +520,7 @@ export function loadLocalData(): SystemData {
         ...backupHistory,
         ...(parsed.attendanceHistory || {}),
       },
-      attendanceToday: parsed.attendanceHistory?.[todayKey] || parsed.attendanceToday || backupToday || {},
+      attendanceToday: parsed.attendanceHistory?.[todayKey] || (parsed.attendanceToday && Object.keys(parsed.attendanceToday).some(b => filteredScanTimes[b]) ? parsed.attendanceToday : {}),
       scanLogTimes: filteredScanTimes,
       payments: mergedPayments,
       scanLogOrder: initialScanOrder,
@@ -1454,7 +1454,7 @@ export function mergeCloudDataWithLocal(local: SystemData, cloud: Partial<System
     if (typeof timeIso === "string" && timeIso.includes("T")) {
       return timeIso.startsWith(todayKey);
     }
-    return true;
+    return false;
   });
 
   const mergedScanTimes: Record<string, string> = {};
@@ -2547,8 +2547,9 @@ export function saveAttendanceAndStudentsBatch(
   scanLogOrder: string[],
   scanLogTimes: Record<string, string>,
   students: Student[],
-  immediateSync: boolean = false,
-  deferCloudSyncUntilGroupFinished: boolean = false
+  immediateSync: boolean = true,
+  deferCloudSyncUntilGroupFinished: boolean = false,
+  customAttendanceHistory?: Record<string, Record<string, string>>
 ): void {
   const current = loadLocalData();
   const todayKey = getTodayKey();
@@ -2559,6 +2560,7 @@ export function saveAttendanceAndStudentsBatch(
     attendanceToday,
     attendanceHistory: {
       ...current.attendanceHistory,
+      ...(customAttendanceHistory || {}),
       [todayKey]: attendanceToday,
     },
     scanLogOrder,
@@ -2568,14 +2570,11 @@ export function saveAttendanceAndStudentsBatch(
   };
 
   if (deferCloudSyncUntilGroupFinished && !immediateSync) {
-    // 1. Instant local persistence (0ms latency, zero quota)
+    // Instant local persistence + peer-to-peer device broadcast
     saveToLocalStorage(updated);
-
-    // Broadcast instantly to other connected laptops/mobiles (< 50ms)
     pushToServerSyncHub(updated).catch(() => {});
     broadcastFullState(updated).catch(() => {});
 
-    // 2. Broadcast to local tabs/windows via zero-quota channel
     recordSmartOperation(
       "state_mutation",
       {
@@ -2590,19 +2589,19 @@ export function saveAttendanceAndStudentsBatch(
       notifySyncStatusChange();
     }
 
-    // 3. Clear rapid debounce timer so individual scans NEVER trigger cloud writes
     if (debounceSyncTimer) {
       clearTimeout(debounceSyncTimer);
       debounceSyncTimer = null;
     }
 
-    // 4. Group session idle safeguard: if inactive for 90 seconds, flush the entire group as a single write
+    // Flush quickly after brief inactivity
     debounceSyncTimer = setTimeout(() => {
       debounceSyncTimer = null;
       flushPendingSyncToCloud().catch(() => {});
-    }, 90000);
+    }, 5000);
   } else {
-    syncDataToCloud(updated, immediateSync);
+    // Instant real-time cloud synchronization without limit
+    syncDataToCloud(updated, true);
   }
 }
 
