@@ -401,13 +401,17 @@ export function loadLocalData(): SystemData {
       localStorage.getItem(PENDING_SYNC_KEY) === "true";
 
     let raw: string | null = null;
-    try {
+    // Strictly isolate LocalStorage: Only read if offline or if pending offline changes exist
+    if (!isOnline || hasOfflinePending) {
       raw =
-        localStorage.getItem(STORAGE_KEY) ||
         localStorage.getItem("center_offline_pending_data") ||
+        localStorage.getItem(STORAGE_KEY) ||
         localStorage.getItem("center_data") ||
         localStorage.getItem("aiman_system_data");
-    } catch {}
+    } else {
+      // Online mode with no pending changes: ensure LocalStorage is clean
+      cleanupLegacyStorageKeys();
+    }
 
     let parsed: any = {};
     if (raw) {
@@ -460,12 +464,22 @@ export function loadLocalData(): SystemData {
     }
 
     const todayKey = getTodayKey();
-    const initialScanOrder: string[] = Array.isArray(parsed.scanLogOrder) ? parsed.scanLogOrder : [];
-    const initialScanTimes: Record<string, string> = parsed.scanLogTimes || {};
+    let initialScanOrder: string[] = Array.isArray(parsed.scanLogOrder) ? parsed.scanLogOrder : [];
+    let initialScanTimes: Record<string, string> = parsed.scanLogTimes || {};
 
-    // 🔒 Scanner Persistence Guarantee: Scans are NEVER auto-deleted on refresh or reload!
-    // Scans are ONLY cleared when the user explicitly confirms "حفظ وإرسال الغياب للكل"
-    const filteredScanTimes: Record<string, string> = { ...initialScanTimes };
+    // Filter out scans that are from previous days so scanner always opens fresh for today
+    initialScanOrder = initialScanOrder.filter((b: string) => {
+      const timeIso = initialScanTimes[b];
+      if (typeof timeIso === "string" && timeIso.includes("T")) {
+        return timeIso.startsWith(todayKey);
+      }
+      return true;
+    });
+
+    const filteredScanTimes: Record<string, string> = {};
+    initialScanOrder.forEach((b: string) => {
+      if (initialScanTimes[b]) filteredScanTimes[b] = initialScanTimes[b];
+    });
 
     const rawPlatformMessages: PlatformMessage[] = Array.isArray(parsed.platformMessages) && parsed.platformMessages.length > 0
       ? parsed.platformMessages
@@ -518,7 +532,7 @@ export function loadLocalData(): SystemData {
       gradeWhatsAppLinks: parsed.gradeWhatsAppLinks || (centerBackup?.gradeWhatsAppLinks as Record<string, string>) || {},
       deletedBarcodes: Array.isArray(parsed.deletedBarcodes) ? parsed.deletedBarcodes : [],
       scanLogUpdatedAt: parseTimestamp(parsed.scanLogUpdatedAt) || 0,
-      updatedAt: parseTimestamp(parsed.updatedAt) || (parsed.students?.length ? 1 : 0),
+      updatedAt: parseTimestamp(parsed.updatedAt) || Date.now(),
     };
     memoryCachedData = loaded;
     return loaded;
@@ -543,6 +557,7 @@ export function cleanupLegacyStorageKeys(): void {
     "aiman_payments",
     "aiman_backup",
     "eman_temp_export",
+    "center_data_v2",
   ];
   for (const k of legacyKeys) {
     try {
@@ -552,17 +567,21 @@ export function cleanupLegacyStorageKeys(): void {
 }
 
 /**
- * Clears temporary offline sync flags without deleting main center data from LocalStorage.
+ * Wipes any temporary offline data from LocalStorage.
+ * The system has NO dependency or persistent data in LocalStorage when online.
+ * Data is pushed and persisted to Cloud (Firestore) and then immediately deleted from LocalStorage.
  */
 export function clearOfflineLocalStorage(): void {
   if (typeof window === "undefined" || typeof localStorage === "undefined") return;
   try {
+    localStorage.removeItem(STORAGE_KEY);
     localStorage.removeItem("center_offline_pending_data");
     localStorage.removeItem("center_has_offline_data");
-    localStorage.setItem(PENDING_SYNC_KEY, "false");
+    localStorage.removeItem(PENDING_SYNC_KEY);
     cleanupLegacyStorageKeys();
+    console.log("[Storage Engine] LocalStorage wiped clean: Data is now 100% on Cloud.");
   } catch (err) {
-    console.warn("Notice clearing offline flags:", err);
+    console.warn("Notice clearing offline storage:", err);
   }
 }
 
@@ -660,12 +679,24 @@ function performDiskPersist(clonedData: SystemData) {
     return;
   }
 
-  // Always save full system state locally so page reload or tab close NEVER loses data
+  const isOnline = typeof navigator !== "undefined" ? navigator.onLine : true;
+
+  // STRICT REQUIREMENT: LocalStorage has NO relationship with the system when online!
+  // All online persistence is held in memory and committed directly to the Cloud (Firebase).
+  if (isOnline) {
+    clearOfflineLocalStorage();
+    return;
+  }
+
+  // ONLY WHEN OFFLINE: Save to LocalStorage as a temporary offline buffer until internet reconnects
   try {
     const compacted = compactSystemPayload(clonedData);
     const serialized = JSON.stringify(compacted);
+    localStorage.setItem("center_offline_pending_data", serialized);
     localStorage.setItem(STORAGE_KEY, serialized);
-    saveSnapshotToIndexedDB(STORAGE_KEY, clonedData).catch(() => {});
+    localStorage.setItem("center_has_offline_data", "true");
+    localStorage.setItem(PENDING_SYNC_KEY, "true");
+    console.log("[Storage Engine] OFFLINE MODE: Saved temporary buffer to LocalStorage. Will flush to Cloud and wipe upon reconnect.");
   } catch (err: any) {
     cleanupLegacyStorageKeys();
 
@@ -673,11 +704,12 @@ function performDiskPersist(clonedData: SystemData) {
       const leanData = createLeanSystemCache(clonedData);
       const leanCompacted = compactSystemPayload(leanData);
       const leanSerialized = JSON.stringify(leanCompacted);
+      localStorage.setItem("center_offline_pending_data", leanSerialized);
       localStorage.setItem(STORAGE_KEY, leanSerialized);
-      saveSnapshotToIndexedDB(STORAGE_KEY, clonedData).catch(() => {});
+      localStorage.setItem("center_has_offline_data", "true");
+      localStorage.setItem(PENDING_SYNC_KEY, "true");
     } catch (err2: any) {
-      console.warn("[Storage Engine] LocalStorage full; preserved in IndexedDB & memory cache.");
-      saveSnapshotToIndexedDB(STORAGE_KEY, clonedData).catch(() => {});
+      console.warn("[Storage Engine] LocalStorage offline buffer full; preserved in memory cache.");
     }
   }
 }
@@ -1005,23 +1037,6 @@ export async function pushToServerSyncHub(data: SystemData): Promise<boolean> {
   }
 }
 
-let pushHubDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-let lastQueuedSyncHubData: SystemData | null = null;
-
-export function pushToServerSyncHubDebounced(data: SystemData, delayMs = 300): void {
-  lastQueuedSyncHubData = data;
-  if (pushHubDebounceTimer) {
-    clearTimeout(pushHubDebounceTimer);
-  }
-  pushHubDebounceTimer = setTimeout(() => {
-    pushHubDebounceTimer = null;
-    if (lastQueuedSyncHubData) {
-      pushToServerSyncHub(lastQueuedSyncHubData).catch(() => {});
-      broadcastFullState(lastQueuedSyncHubData).catch(() => {});
-    }
-  }, delayMs);
-}
-
 /**
  * Perform a direct, guaranteed push of local data to Firestore Cloud Database
  * with intelligent remote merge, automatic partitioning, and exponential backoff retries
@@ -1123,12 +1138,9 @@ export async function flushPendingSyncToCloud(forceManual: boolean = false): Pro
     const currentUpToDateData = loadLocalData();
     lastSyncedDataHash = JSON.stringify(currentUpToDateData);
 
-    // Clear pending offline indicators while retaining local persistent cache
-    try {
-      localStorage.setItem(PENDING_SYNC_KEY, "false");
-      localStorage.removeItem("center_has_offline_data");
-      localStorage.removeItem("center_offline_pending_data");
-    } catch {}
+    // CRITICAL USER REQUIREMENT: Data is now safely recorded in Firebase Firestore & Cloud!
+    // Completely wipe and delete any offline data/buffer from LocalStorage!
+    clearOfflineLocalStorage();
 
     const nowIso = new Date().toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
     try {
@@ -1147,7 +1159,7 @@ export async function flushPendingSyncToCloud(forceManual: boolean = false): Pro
     // Dispatch global custom event
     window.dispatchEvent(
       new CustomEvent("cloud-sync-completed", {
-        detail: { timestamp: new Date().toISOString(), wipedLocalStorage: false },
+        detail: { timestamp: new Date().toISOString(), wipedLocalStorage: true },
       })
     );
 
@@ -1279,8 +1291,11 @@ export function mergeCloudDataWithLocal(local: SystemData, cloud: Partial<System
 
   const normalizeName = (name: string) => (name || "").trim().toLowerCase().replace(/\s+/g, " ");
 
-  // Add all cloud students first
-  if (Array.isArray(cloud.students)) {
+  const isCloudNewer = cloudTime > localTime;
+  const isLocalExplicitlyEmpty = (local.students?.length === 0 && (local.deletedBarcodes?.length || 0) > 0);
+
+  if (isCloudNewer && Array.isArray(cloud.students) && cloud.students.length > 0) {
+    // CLOUD IS MORE RECENT: Cloud is authoritative source of truth!
     cloud.students.forEach((remoteStudent) => {
       if (!remoteStudent?.barcode) return;
       const bKey = String(remoteStudent.barcode).trim();
@@ -1291,17 +1306,43 @@ export function mergeCloudDataWithLocal(local: SystemData, cloud: Partial<System
         nameToBarcodeMap.set(`${normName}_${remoteStudent.groupGrade}`, bKey);
       }
     });
-  }
 
-    // Merge in all local students (preserving local additions and updates)
-    if (Array.isArray(local.students)) {
+    // Only add local students if they were created LOCALLY after cloudTime (offline creation on this device)
+    if (!isLocalExplicitlyEmpty && Array.isArray(local.students)) {
       local.students.forEach((localStudent) => {
         if (!localStudent?.barcode) return;
         const bKey = String(localStudent.barcode).trim();
         if (deletedSet.has(bKey)) return;
+        if (!studentMap.has(bKey)) {
+          const createdAt = parseTimestamp(localStudent.createdAt);
+          if (createdAt > cloudTime) {
+            studentMap.set(bKey, { ...localStudent });
+          }
+        }
+      });
+    }
+  } else {
+    // LOCAL IS NEWER OR EQUAL: Local is authoritative base, add missing remote students
+    (local.students || []).forEach((s) => {
+      if (s?.barcode) {
+        const bKey = String(s.barcode).trim();
+        if (deletedSet.has(bKey)) return;
+        studentMap.set(bKey, { ...s });
+        const normName = normalizeName(s.name);
+        if (normName) {
+          nameToBarcodeMap.set(`${normName}_${s.groupGrade}`, bKey);
+        }
+      }
+    });
 
-        const normName = normalizeName(localStudent.name);
-        const nameKey = `${normName}_${localStudent.groupGrade}`;
+    if (Array.isArray(cloud.students) && !isLocalExplicitlyEmpty) {
+      cloud.students.forEach((remoteStudent) => {
+        if (!remoteStudent?.barcode) return;
+        const bKey = String(remoteStudent.barcode).trim();
+        if (deletedSet.has(bKey)) return;
+
+        const normName = normalizeName(remoteStudent.name);
+        const nameKey = `${normName}_${remoteStudent.groupGrade}`;
 
         let existingKey = bKey;
         if (!studentMap.has(bKey) && normName && nameToBarcodeMap.has(nameKey)) {
@@ -1310,138 +1351,118 @@ export function mergeCloudDataWithLocal(local: SystemData, cloud: Partial<System
 
         const existing = studentMap.get(existingKey);
         if (!existing) {
-          studentMap.set(bKey, { ...localStudent });
+          studentMap.set(bKey, { ...remoteStudent });
           if (normName) {
             nameToBarcodeMap.set(nameKey, bKey);
           }
         } else {
-          // Merge student properties: preserve newest/highest data
-          const localScores = Array.isArray(localStudent.totalExamScores) ? localStudent.totalExamScores : [];
-          const remoteScores = Array.isArray(existing.totalExamScores) ? existing.totalExamScores : [];
+          // Merge student properties intelligently
+          const localScores = Array.isArray(existing.totalExamScores) ? existing.totalExamScores : [];
+          const remoteScores = Array.isArray(remoteStudent.totalExamScores) ? remoteStudent.totalExamScores : [];
           const mergedScores = Array.from(new Set([...localScores, ...remoteScores]));
 
           studentMap.set(existingKey, {
             ...existing,
-            ...localStudent,
-            parentPhone: localStudent.parentPhone || existing.parentPhone || "",
-            phone: localStudent.phone || existing.phone || "",
-            totalAttendanceDays: Math.max(existing.totalAttendanceDays || 0, localStudent.totalAttendanceDays || 0),
-            totalAbsentDays: Math.max(existing.totalAbsentDays || 0, localStudent.totalAbsentDays || 0),
-            points: Math.max(existing.points || 0, localStudent.points || 0),
+            ...remoteStudent,
+            ...existing, // local takes precedence
             totalExamScores: mergedScores.length > 0 ? mergedScores : (localScores.length > 0 ? localScores : remoteScores),
           });
         }
       });
     }
+  }
 
-    const mergedStudents = Array.from(studentMap.values());
+  const mergedStudents = Array.from(studentMap.values());
 
-    // 2. Merge Attendance History & Today
-    const mergedHistory: Record<string, Record<string, string>> = {};
+  // 2. Merge Attendance History & Today
+  const mergedHistory: Record<string, Record<string, string>> = {};
 
-    if (local.attendanceHistory) {
-      for (const [dateKey, dayMap] of Object.entries(local.attendanceHistory)) {
-        mergedHistory[dateKey] = { ...(dayMap || {}) };
+  if (local.attendanceHistory) {
+    for (const [dateKey, dayMap] of Object.entries(local.attendanceHistory)) {
+      mergedHistory[dateKey] = { ...(dayMap || {}) };
+    }
+  }
+
+  if (cloud.attendanceHistory) {
+    for (const [dateKey, remoteDayMap] of Object.entries(cloud.attendanceHistory)) {
+      if (!mergedHistory[dateKey]) {
+        mergedHistory[dateKey] = {};
+      }
+      if (dateKey === todayKey) {
+        continue;
+      }
+      for (const [bCode, status] of Object.entries(remoteDayMap || {})) {
+        if (!mergedHistory[dateKey][bCode] || cloudTime > localTime) {
+          mergedHistory[dateKey][bCode] = status;
+        }
       }
     }
+  }
 
-    if (cloud.attendanceHistory) {
-      for (const [dateKey, remoteDayMap] of Object.entries(cloud.attendanceHistory)) {
-        if (!mergedHistory[dateKey]) {
-          mergedHistory[dateKey] = {};
-        }
-        if (dateKey === todayKey) {
-          continue;
-        }
-        for (const [bCode, status] of Object.entries(remoteDayMap || {})) {
-          if (!deletedSet.has(bCode)) {
-            mergedHistory[dateKey][bCode] = status;
-          }
-        }
-      }
-    }
-
-    // Combine today's attendance: union from both devices
-    const mergedToday: Record<string, string> = {
+  let mergedToday: Record<string, string>;
+  if (localTime >= cloudTime) {
+    mergedToday = {
+      ...(cloud.attendanceToday || {}),
+      ...(local.attendanceToday || {}),
+    };
+  } else {
+    mergedToday = {
       ...(local.attendanceToday || {}),
       ...(cloud.attendanceToday || {}),
     };
-    for (const bCode of deletedBarcodes) {
-      delete mergedToday[bCode];
+  }
+
+  mergedHistory[todayKey] = {
+    ...(mergedHistory[todayKey] || {}),
+    ...mergedToday,
+  };
+
+  // 3. Merge Scan Log Order & Times (authoritative by latest modification timestamp)
+  const remoteOrder = Array.isArray(cloud.scanLogOrder) ? cloud.scanLogOrder : [];
+  const localOrder = Array.isArray(local.scanLogOrder) ? local.scanLogOrder : [];
+
+  const localScanTime = parseTimestamp(local.scanLogUpdatedAt || local.updatedAt);
+  const cloudScanTime = parseTimestamp(cloud.scanLogUpdatedAt || cloud.updatedAt);
+
+  let chosenOrder: string[];
+  let chosenScanTimes: Record<string, string>;
+
+  if (cloudScanTime > localScanTime) {
+    // Cloud has the newer scanner session state (e.g. session finished/cleared or students scanned on another device)
+    chosenOrder = [...remoteOrder];
+    chosenScanTimes = { ...(cloud.scanLogTimes || {}) };
+  } else {
+    // Local device has the newer or equal scanner session state
+    chosenOrder = [...localOrder];
+    chosenScanTimes = { ...(local.scanLogTimes || {}) };
+  }
+
+  // Deduplicate and filter out deleted barcodes
+  const orderSet = new Set<string>();
+  const preMergedOrder: string[] = [];
+
+  chosenOrder.forEach((barcode) => {
+    if (barcode && !orderSet.has(barcode) && !deletedSet.has(barcode)) {
+      orderSet.add(barcode);
+      preMergedOrder.push(barcode);
     }
+  });
 
-    mergedHistory[todayKey] = {
-      ...(mergedHistory[todayKey] || {}),
-      ...mergedToday,
-    };
+  // Filter out any stale scans that are from a previous date so the scanner is always fresh for today
+  const mergedOrder = preMergedOrder.filter((barcode) => {
+    const timeIso = chosenScanTimes[barcode];
+    if (typeof timeIso === "string" && timeIso.includes("T")) {
+      return timeIso.startsWith(todayKey);
+    }
+    return true;
+  });
 
-    // 3. Merge Scan Log Order & Times (union of all today scans, never wiped by opening another tab)
-    const remoteOrder = Array.isArray(cloud.scanLogOrder) ? cloud.scanLogOrder : [];
-    const localOrder = Array.isArray(local.scanLogOrder) ? local.scanLogOrder : [];
-
-    const remoteTimes = cloud.scanLogTimes || {};
-    const localTimes = local.scanLogTimes || {};
-
-    // Combine scan timestamps
-    const combinedScanTimes: Record<string, string> = {};
-    const allScannedBarcodes = new Set<string>();
-
-    Object.keys(localTimes).forEach((b) => {
-      if (b && !deletedSet.has(b)) {
-        combinedScanTimes[b] = localTimes[b];
-        allScannedBarcodes.add(b);
-      }
-    });
-
-    Object.keys(remoteTimes).forEach((b) => {
-      if (b && !deletedSet.has(b)) {
-        const rTime = remoteTimes[b];
-        const lTime = combinedScanTimes[b];
-        if (lTime && rTime) {
-          combinedScanTimes[b] = lTime >= rTime ? lTime : rTime;
-        } else {
-          combinedScanTimes[b] = rTime || lTime || new Date().toISOString();
-        }
-        allScannedBarcodes.add(b);
-      }
-    });
-
-    localOrder.forEach((b) => {
-      if (b && !deletedSet.has(b)) allScannedBarcodes.add(String(b).trim());
-    });
-    remoteOrder.forEach((b) => {
-      if (b && !deletedSet.has(b)) allScannedBarcodes.add(String(b).trim());
-    });
-
-    // Also include anyone who attended or was delayed today
-    Object.keys(mergedToday).forEach((b) => {
-      if (b && !deletedSet.has(b) && (mergedToday[b] === "حضور" || mergedToday[b] === "تأخير")) {
-        allScannedBarcodes.add(String(b).trim());
-        if (!combinedScanTimes[b]) {
-          combinedScanTimes[b] = new Date().toISOString();
-        }
-      }
-    });
-
-    // 🔒 Retain all active scans: Never drop scanned students on remote merge!
-    // They are only removed when the group attendance is finalized ("حفظ وإرسال الغياب للكل")
-    const activeScans = Array.from(allScannedBarcodes);
-
-    // Sort descending by scan time (latest scanned student at index 0)
-    activeScans.sort((a, b) => {
-      const timeA = combinedScanTimes[a] ? new Date(combinedScanTimes[a]).getTime() : 0;
-      const timeB = combinedScanTimes[b] ? new Date(combinedScanTimes[b]).getTime() : 0;
-      return timeB - timeA;
-    });
-
-    const mergedOrder = activeScans;
-
-    const mergedScanTimes: Record<string, string> = {};
-    mergedOrder.forEach((barcode) => {
-      if (combinedScanTimes[barcode]) {
-        mergedScanTimes[barcode] = combinedScanTimes[barcode];
-      }
-    });
+  const mergedScanTimes: Record<string, string> = {};
+  mergedOrder.forEach((barcode) => {
+    if (chosenScanTimes[barcode]) {
+      mergedScanTimes[barcode] = chosenScanTimes[barcode];
+    }
+  });
 
   // 4. Merge Payments (deep merge all months and all student records within each month)
   const mergedPayments: Record<string, Record<string, PaymentRecord>> = {};
@@ -1578,7 +1599,7 @@ export function mergeCloudDataWithLocal(local: SystemData, cloud: Partial<System
     pendingWhatsAppMessages: mergedWhatsApp,
     gradeWhatsAppLinks: mergedGradeWhatsAppLinks,
     deletedBarcodes,
-    scanLogUpdatedAt: Math.max(Number(local.scanLogUpdatedAt) || 0, Number(cloud.scanLogUpdatedAt) || 0, Date.now()),
+    scanLogUpdatedAt: Math.max(localScanTime, cloudScanTime),
     updatedAt: Math.max(localTime, cloudTime),
   };
 }
@@ -2285,10 +2306,14 @@ if (typeof window !== "undefined") {
           Boolean(localStorage.getItem("center_offline_pending_data"));
 
         if (hasOffline) {
-          console.log("[Storage Engine] Online restored with pending offline buffer. Flushing to Cloud...");
-          await flushPendingSyncToCloud(true);
+          console.log("[Storage Engine] Online restored with pending offline buffer. Flushing to Cloud and wiping LocalStorage...");
+          const success = await flushPendingSyncToCloud(true);
+          if (success) {
+            clearOfflineLocalStorage();
+          }
         } else {
           pullLatestCloudDataImmediately().catch(() => {});
+          clearOfflineLocalStorage();
         }
       }
     }, 800);
@@ -2316,12 +2341,11 @@ if (typeof window !== "undefined") {
     }
   });
 
-  // 5. Guaranteed flush on tab close / reload: ALWAYS commit latest state to localStorage
+  // 5. Guaranteed flush on tab close / reload ONLY if offline
   window.addEventListener("beforeunload", () => {
-    if (memoryCachedData) {
+    if (memoryCachedData && !navigator.onLine) {
       try {
-        const compacted = compactSystemPayload(memoryCachedData);
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(compacted));
+        saveToLocalStorage(memoryCachedData, false);
       } catch (e) {}
     }
   });
@@ -2472,9 +2496,15 @@ export async function autoPushLocalDiskOnStartup(): Promise<boolean> {
       Boolean(localStorage.getItem("center_offline_pending_data"));
 
     if (hasPending && isOnline) {
-      console.log("[Storage Engine] Detected offline changes in LocalStorage. Uploading to Firestore...");
+      console.log("[Storage Engine] Detected offline changes in LocalStorage. Uploading to Firestore and wiping LocalStorage...");
       const success = await flushPendingSyncToCloud(true);
+      if (success) {
+        clearOfflineLocalStorage();
+      }
       return success;
+    } else if (isOnline) {
+      // Clean up any remaining legacy data so LocalStorage is completely empty of database records
+      clearOfflineLocalStorage();
     }
     return true;
   } catch (err) {
@@ -2538,11 +2568,12 @@ export function saveAttendanceAndStudentsBatch(
   };
 
   if (deferCloudSyncUntilGroupFinished && !immediateSync) {
-    // 1. Instant local persistence (0ms latency, zero quota, crash proof)
+    // 1. Instant local persistence (0ms latency, zero quota)
     saveToLocalStorage(updated);
 
-    // Broadcast smoothly to other connected devices (< 300ms debounce during 100 students burst)
-    pushToServerSyncHubDebounced(updated, 300);
+    // Broadcast instantly to other connected laptops/mobiles (< 50ms)
+    pushToServerSyncHub(updated).catch(() => {});
+    broadcastFullState(updated).catch(() => {});
 
     // 2. Broadcast to local tabs/windows via zero-quota channel
     recordSmartOperation(

@@ -422,142 +422,37 @@ async function startServer() {
     });
   });
 
-  function mergeServerState(existing: any, incoming: any): any {
-    if (!existing) return incoming;
-    if (!incoming) return existing;
-
-    const deletedBarcodes = Array.isArray(incoming.deletedBarcodes)
-      ? incoming.deletedBarcodes
-      : Array.isArray(existing.deletedBarcodes)
-      ? existing.deletedBarcodes
-      : [];
-    const deletedSet = new Set<string>(deletedBarcodes.map((b: any) => String(b).trim()));
-
-    // 1. Merge Students
-    const studentMap = new Map<string, any>();
-    if (Array.isArray(existing.students)) {
-      existing.students.forEach((s: any) => {
-        if (s?.barcode && !deletedSet.has(String(s.barcode).trim())) {
-          studentMap.set(String(s.barcode).trim(), s);
-        }
-      });
-    }
-    if (Array.isArray(incoming.students)) {
-      incoming.students.forEach((s: any) => {
-        if (s?.barcode && !deletedSet.has(String(s.barcode).trim())) {
-          const b = String(s.barcode).trim();
-          const prev = studentMap.get(b);
-          if (!prev) {
-            studentMap.set(b, s);
-          } else {
-            studentMap.set(b, {
-              ...prev,
-              ...s,
-              parentPhone: s.parentPhone || prev.parentPhone || "",
-              phone: s.phone || prev.phone || "",
-              totalAttendanceDays: Math.max(prev.totalAttendanceDays || 0, s.totalAttendanceDays || 0),
-              totalAbsentDays: Math.max(prev.totalAbsentDays || 0, s.totalAbsentDays || 0),
-              points: Math.max(prev.points || 0, s.points || 0),
-            });
-          }
-        }
-      });
+  // 4. Push Unified State Update with Immediate Real-time Broadcast
+  app.post(["/api/sync/push", "/api/sync/unified/push"], (req: Request, res: Response) => {
+    const { data, sourceDeviceId } = req.body;
+    if (!data) {
+      return res.status(400).json({ ok: false, error: "No data payload provided" });
     }
 
-    // 2. Merge Attendance
-    const mergedAttendanceToday: Record<string, string> = {
-      ...(existing.attendanceToday || {}),
-      ...(incoming.attendanceToday || {}),
-    };
-    deletedSet.forEach((b: string) => {
-      delete mergedAttendanceToday[b];
-    });
+    cachedServerState = data;
+    lastServerUpdate = Date.now();
 
-    const mergedAttendanceHistory: Record<string, any> = {
-      ...(existing.attendanceHistory || {}),
-    };
-    if (incoming.attendanceHistory) {
-      for (const [d, map] of Object.entries(incoming.attendanceHistory)) {
-        mergedAttendanceHistory[d] = {
-          ...(mergedAttendanceHistory[d] || {}),
-          ...((map as any) || {}),
-        };
-      }
-    }
-    const todayKey = new Date().toISOString().slice(0, 10);
-    mergedAttendanceHistory[todayKey] = {
-      ...(mergedAttendanceHistory[todayKey] || {}),
-      ...mergedAttendanceToday,
-    };
-
-    // 3. Merge Scan Log Order and Times
-    const existingOrder = Array.isArray(existing.scanLogOrder) ? existing.scanLogOrder : [];
-    const incomingOrder = Array.isArray(incoming.scanLogOrder) ? incoming.scanLogOrder : [];
-    const existingTimes = existing.scanLogTimes || {};
-    const incomingTimes = incoming.scanLogTimes || {};
-
-    const mergedScanTimes: Record<string, string> = { ...existingTimes, ...incomingTimes };
-    const allScanned = new Set<string>();
-
-    existingOrder.forEach((b: string) => {
-      if (b && !deletedSet.has(b)) allScanned.add(String(b).trim());
-    });
-    incomingOrder.forEach((b: string) => {
-      if (b && !deletedSet.has(b)) allScanned.add(String(b).trim());
-    });
-    Object.keys(mergedAttendanceToday).forEach((b) => {
-      if (b && !deletedSet.has(b) && (mergedAttendanceToday[b] === "حضور" || mergedAttendanceToday[b] === "تأخير")) {
-        allScanned.add(String(b).trim());
-        if (!mergedScanTimes[b]) {
-          mergedScanTimes[b] = new Date().toISOString();
-        }
-      }
-    });
-
-    // 🔒 Preserve all scanned barcodes! Never delete or drop barcodes due to UTC/local date discrepancies!
-    const activeBarcodes = Array.from(allScanned);
-
-    activeBarcodes.sort((a, b) => {
-      const timeA = mergedScanTimes[a] ? new Date(mergedScanTimes[a]).getTime() : 0;
-      const timeB = mergedScanTimes[b] ? new Date(mergedScanTimes[b]).getTime() : 0;
-      return timeB - timeA;
-    });
-
-    // 4. Merge Payments
-    const mergedPayments: Record<string, any> = { ...(existing.payments || {}) };
-    if (incoming.payments) {
-      for (const [m, recs] of Object.entries(incoming.payments)) {
-        mergedPayments[m] = { ...(mergedPayments[m] || {}), ...((recs as any) || {}) };
-      }
+    // Persist to disk asynchronously
+    try {
+      fs.writeFileSync(SYNC_STATE_FILE, JSON.stringify(data), "utf-8");
+    } catch (err) {
+      console.error("[Sync Hub] Failed to write unified state to disk:", err);
     }
 
-    return {
-      ...existing,
-      ...incoming,
-      students: Array.from(studentMap.values()),
-      attendanceToday: mergedAttendanceToday,
-      attendanceHistory: mergedAttendanceHistory,
-      scanLogOrder: activeBarcodes,
-      scanLogTimes: mergedScanTimes,
-      payments: mergedPayments,
-      deletedBarcodes: Array.from(deletedSet),
-      updatedAt: Math.max(existing.updatedAt || 0, incoming.updatedAt || 0, Date.now()),
-    };
-  }
+    // Broadcast instantly to all unified screens
+    broadcastToUnified({
+      type: "state_update",
+      sourceDeviceId: sourceDeviceId || "unknown",
+      updatedAt: lastServerUpdate,
+      data,
+    });
 
-  // Server Firestore mirror debounce timer for high-volume rapid scanning
-  let serverFirestoreDebounceTimer: NodeJS.Timeout | null = null;
-  function scheduleServerFirestoreMirror(data: any, updateTime: number, devId: string) {
-    if (!serverFirestoreDb) return;
-    if (serverFirestoreDebounceTimer) {
-      clearTimeout(serverFirestoreDebounceTimer);
-    }
-    serverFirestoreDebounceTimer = setTimeout(async () => {
-      serverFirestoreDebounceTimer = null;
+    // Mirror asynchronously to Cloud Firestore so all external platforms stay 100% unified
+    if (serverFirestoreDb) {
       try {
         const compressedPayload = compressCloudPayload(data);
         const docRef = doc(serverFirestoreDb, "system_state", "main_center_data");
-        await setDoc(
+        setDoc(
           docRef,
           {
             _compressedPayload: compressedPayload,
@@ -566,48 +461,19 @@ async function startServer() {
               (acc: number, m: any) => acc + Object.keys(m || {}).length,
               0
             ),
-            updatedAt: updateTime,
-            _lastClientId: devId || "server_sync_hub",
+            updatedAt: lastServerUpdate,
+            _lastClientId: sourceDeviceId || "server_sync_hub",
             syncedAtIso: new Date().toISOString(),
           },
           { merge: true }
-        );
+        ).catch((e) => console.warn("[Sync Hub] Background Firestore write warning:", e?.message));
       } catch (e: any) {
-        console.warn("[Sync Hub] Background Firestore write warning:", e?.message);
+        console.warn("[Sync Hub] Firestore mirror compression note:", e?.message);
       }
-    }, 2000);
-  }
-
-  // 4. Push Unified State Update with Immediate Real-time Broadcast
-  app.post(["/api/sync/push", "/api/sync/unified/push"], (req: Request, res: Response) => {
-    const { data, sourceDeviceId } = req.body;
-    if (!data) {
-      return res.status(400).json({ ok: false, error: "No data payload provided" });
     }
-
-    const mergedData = mergeServerState(cachedServerState, data);
-    cachedServerState = mergedData;
-    lastServerUpdate = Date.now();
-
-    // Persist to disk asynchronously without blocking the event loop
-    fs.promises.writeFile(SYNC_STATE_FILE, JSON.stringify(mergedData), "utf-8").catch((err) => {
-      console.error("[Sync Hub] Failed to write unified state to disk:", err);
-    });
-
-    // Broadcast instantly to all unified screens
-    broadcastToUnified({
-      type: "state_update",
-      sourceDeviceId: sourceDeviceId || "unknown",
-      updatedAt: lastServerUpdate,
-      data: mergedData,
-    });
-
-    // Mirror asynchronously to Cloud Firestore with debouncing
-    scheduleServerFirestoreMirror(mergedData, lastServerUpdate, sourceDeviceId || "unknown");
 
     res.json({
       ok: true,
-      data: mergedData,
       updatedAt: lastServerUpdate,
       broadcastedToClients: sseSubscribers.size,
     });

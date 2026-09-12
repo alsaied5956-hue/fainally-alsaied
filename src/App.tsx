@@ -232,22 +232,26 @@ export default function App() {
       setSyncStatus(status);
     });
 
-    const handleSyncCompleted = () => {
+    const handleSyncCompleted = (e?: Event) => {
+      const customEvent = e as CustomEvent<any>;
+      const isWiped = customEvent?.detail?.wipedLocalStorage;
       setSyncBanner({
         show: true,
         type: "online-synced",
-        message: "☁️ تم حفظ ومزامنة كافة التعديلات بنجاح وتحديث كافة الأجهزة!",
+        message: isWiped
+          ? "☁️ تم حفظ وتسجيل كافة التعديلات على السحابة (Firebase) ومسح الذاكرة المحلية للجهاز بنجاح!"
+          : "تم الاتصال بالسحابة وتأكيد حفظ البيانات بنجاح!",
       });
       setTimeout(() => {
         setSyncBanner(null);
-      }, 4000);
+      }, 5000);
     };
 
     const handleOffline = () => {
       setSyncBanner({
         show: true,
         type: "offline-mode",
-        message: "⚠️ وضع العمل بدون إنترنت - يتم حفظ كافة التعديلات والبيانات محلياً على الجهاز بأمان، وستتم المزامنة تلقائياً عند عودة الإنترنت.",
+        message: "⚠️ أنت الآن في وضع الأوفلاين (بدون نت) - يتم الحفظ مؤقتاً على الذاكرة المحلية، وسيتم رفع التعديلات للسحابة ومسحها فور عودة الإنترنت.",
       });
     };
 
@@ -360,21 +364,9 @@ export default function App() {
     }
   };
 
-  // Authoritative synchronous refs for high-frequency scanner throughput (100 students / 3 min)
+  // Keep latest students reference for realtime events
   const appStudentsRef = useRef(students);
   appStudentsRef.current = students;
-
-  const attendanceTodayRef = useRef(attendanceToday);
-  attendanceTodayRef.current = attendanceToday;
-
-  const attendanceHistoryRef = useRef(attendanceHistory);
-  attendanceHistoryRef.current = attendanceHistory;
-
-  const scanLogOrderRef = useRef(scanLogOrder);
-  scanLogOrderRef.current = scanLogOrder;
-
-  const scanLogTimesRef = useRef(scanLogTimes);
-  scanLogTimesRef.current = scanLogTimes;
 
   // ⚡ Central Supabase Realtime Hub: Listen to Group Finalization, Payments, and Students across all devices (<20ms)
   useEffect(() => {
@@ -502,55 +494,27 @@ export default function App() {
       const timeIso = payload.timeIso || new Date().toISOString();
       const dateKey = getTodayKey();
 
-      const currentToday = attendanceTodayRef.current;
-      const currentHistory = attendanceHistoryRef.current;
-      const currentOrder = scanLogOrderRef.current;
-      const currentTimes = scanLogTimesRef.current;
-      const currentStudents = appStudentsRef.current;
+      setAttendanceToday((prev) => ({ ...prev, [b]: status }));
+      setAttendanceHistory((prev) => {
+        const dayMap = { ...(prev[dateKey] || {}) };
+        dayMap[b] = status;
+        return { ...prev, [dateKey]: dayMap };
+      });
+      setScanLogOrder((prev) => (prev.includes(b) ? prev : [b, ...prev]));
+      setScanLogTimes((prev) => ({ ...prev, [b]: timeIso }));
 
-      const isFirstTimeToday = !currentToday[b];
-      const updatedToday = { ...currentToday, [b]: status };
-      const updatedHistory = {
-        ...currentHistory,
-        [dateKey]: {
-          ...(currentHistory[dateKey] || {}),
-          [b]: status,
-        },
-      };
-      const updatedOrder = currentOrder.includes(b) ? currentOrder : [b, ...currentOrder];
-      const updatedTimes = { ...currentTimes, [b]: timeIso };
-
-      let updatedStudents = currentStudents;
-      if (isFirstTimeToday) {
-        updatedStudents = currentStudents.map((s) => {
-          if (String(s.barcode).trim() === b) {
+      // Also increment student total attendance days if first time today
+      setStudents((prev) =>
+        prev.map((s) => {
+          if (s.barcode === b) {
             return {
               ...s,
               totalAttendanceDays: (s.totalAttendanceDays || 0) + 1,
             };
           }
           return s;
-        });
-      }
-
-      // Synchronously update refs first
-      attendanceTodayRef.current = updatedToday;
-      attendanceHistoryRef.current = updatedHistory;
-      scanLogOrderRef.current = updatedOrder;
-      scanLogTimesRef.current = updatedTimes;
-      appStudentsRef.current = updatedStudents;
-
-      // Update React state
-      setAttendanceToday(updatedToday);
-      setAttendanceHistory(updatedHistory);
-      setScanLogOrder(updatedOrder);
-      setScanLogTimes(updatedTimes);
-      if (isFirstTimeToday) {
-        setStudents(updatedStudents);
-      }
-
-      // 🔒 Persist to this receiving device's local storage so closing the app preserves the scan!
-      saveAttendanceAndStudentsBatch(updatedToday, updatedOrder, updatedTimes, updatedStudents, false, true);
+        })
+      );
 
       setSyncBanner({
         show: true,
@@ -583,40 +547,31 @@ export default function App() {
     };
   }, []);
 
-  // Handler: Scan Attendance Record (Atomic, Leak-Free, 100 students / 3 min capacity)
+  // Handler: Scan Attendance Record
   const handleRecordAttendance = useCallback((
     barcode: string,
     status: "حضور" | "تأخير",
     timeIso: string,
     student: Student
   ) => {
-    const cleanBarcode = String(barcode).trim();
-    const currentToday = attendanceTodayRef.current;
-    const currentHistory = attendanceHistoryRef.current;
-    const currentOrder = scanLogOrderRef.current;
-    const currentTimes = scanLogTimesRef.current;
-    const currentStudents = appStudentsRef.current;
-
-    const prevStatus = currentToday[cleanBarcode];
-    const updatedToday = { ...currentToday, [cleanBarcode]: status };
+    const updatedToday = { ...attendanceToday, [barcode]: status };
     const todayKey = getTodayKey();
     const updatedHistory = {
-      ...currentHistory,
-      [todayKey]: {
-        ...(currentHistory[todayKey] || {}),
-        [cleanBarcode]: status,
-      },
+      ...attendanceHistory,
+      [todayKey]: updatedToday,
     };
-    const updatedOrder = currentOrder.includes(cleanBarcode)
-      ? currentOrder
-      : [cleanBarcode, ...currentOrder];
-    const updatedTimes = { ...currentTimes, [cleanBarcode]: timeIso };
+    const updatedOrder = scanLogOrder.includes(barcode)
+      ? scanLogOrder
+      : [barcode, ...scanLogOrder];
+    const updatedTimes = { ...scanLogTimes, [barcode]: timeIso };
 
-    let updatedStudents = currentStudents;
-    // Only increment total days if this student had no prior status recorded today
+    const prevStatus = attendanceToday[barcode];
+    let updatedStudents = students;
+    
+    // Only update student record if attendance state actually newly increments
     if (!prevStatus) {
-      updatedStudents = currentStudents.map((s) => {
-        if (String(s.barcode).trim() === cleanBarcode) {
+      updatedStudents = students.map((s) => {
+        if (s.barcode === barcode) {
           return {
             ...s,
             totalAttendanceDays: (s.totalAttendanceDays || 0) + 1,
@@ -624,42 +579,32 @@ export default function App() {
         }
         return s;
       });
+      setStudents(updatedStudents);
     }
 
-    // Synchronously update refs first so immediate subsequent scans have the true latest state
-    attendanceTodayRef.current = updatedToday;
-    attendanceHistoryRef.current = updatedHistory;
-    scanLogOrderRef.current = updatedOrder;
-    scanLogTimesRef.current = updatedTimes;
-    appStudentsRef.current = updatedStudents;
-
-    // Trigger UI updates
     setAttendanceToday(updatedToday);
     setAttendanceHistory(updatedHistory);
     setScanLogOrder(updatedOrder);
     setScanLogTimes(updatedTimes);
-    if (!prevStatus) {
-      setStudents(updatedStudents);
-    }
 
     // ⚡ Dual-Sync to Firebase and Supabase immediately with sourceDeviceId
     dualSyncLiveScan({
-      barcode: cleanBarcode,
+      barcode,
       name: student.name,
       grade: student.groupGrade,
       days: student.groupDays,
       status,
       timeIso,
       timeDisplay: new Date(timeIso).toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" }),
-      isPaid: isStudentPaid(payments?.[getCurrentMonthKey()], cleanBarcode),
+      isPaid: isStudentPaid(payments?.[getCurrentMonthKey()], barcode),
       scannedBy: currentUser?.username || "الماسح",
       studentFallback: student,
       sourceDeviceId: getPersistentDeviceId(),
     });
 
-    // Instant local save with batching (0ms local disk persistence, crash-proof)
+    // Instant local save with batching
     saveAttendanceAndStudentsBatch(updatedToday, updatedOrder, updatedTimes, updatedStudents, false, true);
-  }, [payments, currentUser]);
+  }, [attendanceToday, attendanceHistory, scanLogOrder, scanLogTimes, students, payments, currentUser]);
 
   // Handler: Manual sync for group attendance session in one single operation
   const handleSyncGroupSession = useCallback(async () => {
